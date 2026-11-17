@@ -74,6 +74,8 @@ public class MainActivity extends Activity {
     private Model modeleVosk;
     private Recognizer recLibre, recGuet;
     private Thread filEcoute;
+    private int numeroSession = 0;
+    private java.util.concurrent.LinkedBlockingQueue<short[]> fileLibre, fileGuet;
     private volatile boolean filActif = false;
     private int baseCompte = 0, totalLibre = 0, totalGuet = 0, maxPartielLibre = 0;
     private boolean chargementModele = false;
@@ -406,49 +408,104 @@ public class MainActivity extends Activity {
         totalGuet = 0;
         maxPartielLibre = 0;
         filActif = true;
-        final Recognizer libre = recLibre, guet = recGuet;
-        filEcoute = new Thread(() -> {
-            short[] tampon = new short[1600]; // 0,1 seconde
+        final int session = ++numeroSession;
+        final java.util.concurrent.LinkedBlockingQueue<short[]> fileLibre = new java.util.concurrent.LinkedBlockingQueue<>();
+        final java.util.concurrent.LinkedBlockingQueue<short[]> fileGuet = new java.util.concurrent.LinkedBlockingQueue<>();
+        final short[] FIN = new short[0];
+        this.fileLibre = fileLibre;
+        this.fileGuet = fileGuet;
+
+        // 1) Le micro : il ne fait QUE lire le son et le ranger. Rien n'est jamais jeté.
+        Thread filMicro = new Thread(() -> {
+            android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_URGENT_AUDIO);
             micro.startRecording();
             while (filActif) {
-                int n = micro.read(tampon, 0, tampon.length);
+                short[] bloc = new short[1600]; // 0,1 seconde
+                int n = micro.read(bloc, 0, bloc.length);
                 if (n <= 0) continue;
-                if (libre.acceptWaveForm(tampon, n)) {
-                    String r = libre.getResult();
-                    handler.post(() -> resultatLibre(r, true));
-                } else {
-                    String r = libre.getPartialResult();
-                    handler.post(() -> resultatLibre(r, false));
-                }
-                if (guet.acceptWaveForm(tampon, n)) {
-                    String r = guet.getResult();
-                    handler.post(() -> resultatGuet(r));
-                }
+                if (n < bloc.length) bloc = java.util.Arrays.copyOf(bloc, n);
+                fileLibre.offer(bloc);
+                fileGuet.offer(bloc);
             }
             try { micro.stop(); } catch (Exception ignored) { }
             micro.release();
-        }, "ecoute-cest-ca");
-        filEcoute.start();
+            fileLibre.offer(FIN);
+            fileGuet.offer(FIN);
+        }, "micro");
+
+        // 2) Chaque moteur travaille de son côté, à son rythme, sur son propre cœur du processeur
+        final Recognizer libre = recLibre, guet = recGuet;
+        recLibre = null;
+        recGuet = null;
+        Thread filLibre = new Thread(() -> {
+            int compteur = 0;
+            try {
+                while (true) {
+                    short[] bloc = fileLibre.take();
+                    if (bloc == FIN) break;
+                    if (libre.acceptWaveForm(bloc, bloc.length)) {
+                        String r = libre.getResult();
+                        handler.post(() -> resultatLibre(session, r, true));
+                    } else if (++compteur % 4 == 0) { // texte provisoire 2 à 3 fois par seconde suffit
+                        String r = libre.getPartialResult();
+                        handler.post(() -> resultatLibre(session, r, false));
+                    }
+                }
+                String r = libre.getFinalResult();
+                handler.post(() -> resultatLibre(session, r, true));
+            } catch (InterruptedException ignored) {
+            } finally {
+                libre.close();
+            }
+        }, "moteur-libre");
+        Thread filGuet = new Thread(() -> {
+            try {
+                while (true) {
+                    short[] bloc = fileGuet.take();
+                    if (bloc == FIN) break;
+                    if (guet.acceptWaveForm(bloc, bloc.length)) {
+                        String r = guet.getResult();
+                        handler.post(() -> resultatGuet(session, r));
+                    }
+                }
+                String r = guet.getFinalResult();
+                handler.post(() -> resultatGuet(session, r));
+            } catch (InterruptedException ignored) {
+            } finally {
+                guet.close();
+            }
+        }, "moteur-guet");
+
+        filLibre.setPriority(Thread.MAX_PRIORITY);
+        filGuet.setPriority(Thread.MAX_PRIORITY);
+        filLibre.start();
+        filGuet.start();
+        filMicro.start();
+        filEcoute = filMicro;
         passerEnEcoute(false);
         txtTexte.setText("Le texte entendu s'affichera ici.");
     }
 
     private void arreterHorsLigne() {
+        // On coupe le micro ; les moteurs finissent tranquillement le son déjà enregistré
         filActif = false;
-        if (filEcoute != null) {
-            try { filEcoute.join(800); } catch (InterruptedException ignored) { }
-            filEcoute = null;
-        }
-        if (recLibre != null) { recLibre.close(); recLibre = null; }
-        if (recGuet != null) { recGuet.close(); recGuet = null; }
+        filEcoute = null;
+    }
+
+    /** Retard de traitement, en secondes (son enregistré mais pas encore analysé). */
+    private double retardHorsLigne() {
+        int n = 0;
+        if (fileLibre != null) n = Math.max(n, fileLibre.size());
+        if (fileGuet != null) n = Math.max(n, fileGuet.size());
+        return n / 10.0;
     }
 
     private static String lireJson(String json, String cle) {
         try { return new JSONObject(json).optString(cle, ""); } catch (Exception e) { return ""; }
     }
 
-    private void resultatLibre(String json, boolean definitif) {
-        if (!enEcoute || !modeHorsLigne.isChecked()) return;
+    private void resultatLibre(int session, String json, boolean definitif) {
+        if (session != numeroSession) return;
         if (!definitif) {
             String partiel = lireJson(json, "partial");
             maxPartielLibre = Math.max(maxPartielLibre, compter(partiel));
@@ -466,8 +523,8 @@ public class MainActivity extends Activity {
         majTotalHorsLigne();
     }
 
-    private void resultatGuet(String json) {
-        if (!enEcoute || !modeHorsLigne.isChecked()) return;
+    private void resultatGuet(int session, String json) {
+        if (session != numeroSession) return;
         totalGuet += compter(lireJson(json, "text"));
         majTotalHorsLigne();
     }
@@ -626,6 +683,16 @@ public class MainActivity extends Activity {
     }
 
     private void majDuree() {
+        if (enEcoute && modeHorsLigne.isChecked()) {
+            double r = retardHorsLigne();
+            if (r >= 1.5) {
+                txtEtat.setText(String.format(Locale.FRANCE, "● J'écoute… (analyse en retard de %.0f s, rien n'est perdu)", r));
+                txtEtat.setTextColor(ACCENT);
+            } else {
+                txtEtat.setText("● J'écoute… (analyse en temps réel)");
+                txtEtat.setTextColor(VERT);
+            }
+        }
         long s = dureeTotale() / 1000;
         txtDuree.setText(String.format(Locale.FRANCE, "%02d:%02d", s / 60, s % 60));
         majRythme();
@@ -638,9 +705,7 @@ public class MainActivity extends Activity {
 
     private void remettreAZero() {
         compte = 0;
-        baseCompte = 0;
-        totalLibre = 0;
-        totalGuet = 0;
+        baseCompte = -Math.max(totalLibre, totalGuet);
         maxPartielLibre = 0;
         tempsCumule = 0;
         if (enEcoute) debutSegment = SystemClock.elapsedRealtime();
@@ -656,7 +721,6 @@ public class MainActivity extends Activity {
         handler.removeCallbacksAndMessages(null);
         couperSon(false);
         arreterHorsLigne();
-        if (modeleVosk != null) { modeleVosk.close(); modeleVosk = null; }
         if (reco != null) {
             try { reco.destroy(); } catch (Exception ignored) { }
             reco = null;
