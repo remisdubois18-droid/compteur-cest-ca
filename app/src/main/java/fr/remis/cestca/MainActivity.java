@@ -8,7 +8,10 @@ import android.content.pm.PackageManager;
 import android.graphics.Color;
 import android.graphics.Typeface;
 import android.graphics.drawable.GradientDrawable;
+import android.media.AudioFormat;
 import android.media.AudioManager;
+import android.media.AudioRecord;
+import android.media.MediaRecorder;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
@@ -40,7 +43,6 @@ import org.vosk.LibVosk;
 import org.vosk.LogLevel;
 import org.vosk.Model;
 import org.vosk.Recognizer;
-import org.vosk.android.SpeechService;
 import org.vosk.android.StorageService;
 
 import java.util.ArrayList;
@@ -70,7 +72,10 @@ public class MainActivity extends Activity {
 
     // Moteur hors connexion (Vosk)
     private Model modeleVosk;
-    private SpeechService serviceVosk;
+    private Recognizer recLibre, recGuet;
+    private Thread filEcoute;
+    private volatile boolean filActif = false;
+    private int baseCompte = 0, totalLibre = 0, totalGuet = 0, maxPartielLibre = 0;
     private boolean chargementModele = false;
 
     // Moteur Google : meilleur nombre vu dans les résultats provisoires de la phrase en cours
@@ -365,49 +370,112 @@ public class MainActivity extends Activity {
 
     private void ecouterHorsLigne() {
         try {
-            // On ne guette que l'expression : tout le reste est classé « inconnu »
+            // Deux moteurs écoutent le même son :
+            //  - « libre » transcrit tout (bon pour les « c'est ça » pris dans une phrase)
+            //  - « guet » ne cherche que l'expression (bon pour les « c'est ça » isolés)
             String grammaire = "[\"c'est ça\", \"c' est ça\", \"s'est ça\", \"[unk]\"]";
-            Recognizer rec = new Recognizer(modeleVosk, 16000.0f, grammaire);
-            serviceVosk = new SpeechService(rec, 16000.0f);
-            serviceVosk.startListening(ecouteurHorsLigne);
-            passerEnEcoute(false);
-            txtTexte.setText("Mode hors connexion : seuls les « c'est ça » détectés s'affichent ici.");
+            recLibre = new Recognizer(modeleVosk, 16000.0f);
+            recGuet = new Recognizer(modeleVosk, 16000.0f, grammaire);
         } catch (Exception e) {
-            txtEtat.setText("Erreur du micro : " + e.getMessage());
+            txtEtat.setText("Erreur du moteur : " + e.getMessage());
             txtEtat.setTextColor(ROUGE);
+            return;
         }
+
+        // Micro « brut » : capte toute la pièce, et pas seulement la personne qui tient le téléphone
+        int taille = Math.max(AudioRecord.getMinBufferSize(16000, AudioFormat.CHANNEL_IN_MONO,
+                AudioFormat.ENCODING_PCM_16BIT), 16000 * 2);
+        final AudioRecord micro;
+        try {
+            micro = new AudioRecord(MediaRecorder.AudioSource.MIC, 16000,
+                    AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT, taille);
+        } catch (SecurityException e) {
+            txtEtat.setText("Accès au micro refusé.");
+            txtEtat.setTextColor(ROUGE);
+            return;
+        }
+        if (micro.getState() != AudioRecord.STATE_INITIALIZED) {
+            micro.release();
+            txtEtat.setText("Le micro est déjà utilisé par une autre application.");
+            txtEtat.setTextColor(ROUGE);
+            return;
+        }
+
+        baseCompte = compte;
+        totalLibre = 0;
+        totalGuet = 0;
+        maxPartielLibre = 0;
+        filActif = true;
+        final Recognizer libre = recLibre, guet = recGuet;
+        filEcoute = new Thread(() -> {
+            short[] tampon = new short[1600]; // 0,1 seconde
+            micro.startRecording();
+            while (filActif) {
+                int n = micro.read(tampon, 0, tampon.length);
+                if (n <= 0) continue;
+                if (libre.acceptWaveForm(tampon, n)) {
+                    String r = libre.getResult();
+                    handler.post(() -> resultatLibre(r, true));
+                } else {
+                    String r = libre.getPartialResult();
+                    handler.post(() -> resultatLibre(r, false));
+                }
+                if (guet.acceptWaveForm(tampon, n)) {
+                    String r = guet.getResult();
+                    handler.post(() -> resultatGuet(r));
+                }
+            }
+            try { micro.stop(); } catch (Exception ignored) { }
+            micro.release();
+        }, "ecoute-cest-ca");
+        filEcoute.start();
+        passerEnEcoute(false);
+        txtTexte.setText("Le texte entendu s'affichera ici.");
     }
 
     private void arreterHorsLigne() {
-        if (serviceVosk != null) {
-            try { serviceVosk.stop(); serviceVosk.shutdown(); } catch (Exception ignored) { }
-            serviceVosk = null;
+        filActif = false;
+        if (filEcoute != null) {
+            try { filEcoute.join(800); } catch (InterruptedException ignored) { }
+            filEcoute = null;
         }
+        if (recLibre != null) { recLibre.close(); recLibre = null; }
+        if (recGuet != null) { recGuet.close(); recGuet = null; }
     }
 
-    private final org.vosk.android.RecognitionListener ecouteurHorsLigne = new org.vosk.android.RecognitionListener() {
-        @Override public void onPartialResult(String hypothese) { }
-        @Override public void onResult(String hypothese) { traiterHorsLigne(hypothese); }
-        @Override public void onFinalResult(String hypothese) { traiterHorsLigne(hypothese); }
-        @Override public void onError(Exception e) {
-            txtEtat.setText("Erreur : " + e.getMessage());
-            txtEtat.setTextColor(ROUGE);
-        }
-        @Override public void onTimeout() { }
-    };
+    private static String lireJson(String json, String cle) {
+        try { return new JSONObject(json).optString(cle, ""); } catch (Exception e) { return ""; }
+    }
 
-    private void traiterHorsLigne(String json) {
-        if (!enEcoute) return;
-        String texte;
-        try { texte = new JSONObject(json).optString("text", ""); } catch (Exception e) { return; }
-        int n = compter(texte);
-        if (n > 0) {
-            ajouter(n);
-            String heure = String.format(Locale.FRANCE, "%tH:%<tM:%<tS", new java.util.Date());
-            historique.add(heure + "  c'est ça" + (n > 1 ? " ×" + n : ""));
-            if (historique.size() > 40) historique.remove(0);
-            afficherTexte("");
+    private void resultatLibre(String json, boolean definitif) {
+        if (!enEcoute || !modeHorsLigne.isChecked()) return;
+        if (!definitif) {
+            String partiel = lireJson(json, "partial");
+            maxPartielLibre = Math.max(maxPartielLibre, compter(partiel));
+            afficherTexte(partiel);
+            return;
         }
+        String texte = lireJson(json, "text").trim();
+        totalLibre += Math.max(compter(texte), maxPartielLibre);
+        maxPartielLibre = 0;
+        if (!texte.isEmpty()) {
+            historique.add(texte);
+            if (historique.size() > 40) historique.remove(0);
+        }
+        afficherTexte("");
+        majTotalHorsLigne();
+    }
+
+    private void resultatGuet(String json) {
+        if (!enEcoute || !modeHorsLigne.isChecked()) return;
+        totalGuet += compter(lireJson(json, "text"));
+        majTotalHorsLigne();
+    }
+
+    // On garde le meilleur des deux moteurs
+    private void majTotalHorsLigne() {
+        int cible = baseCompte + Math.max(totalLibre, totalGuet);
+        if (cible > compte) ajouter(cible - compte);
     }
 
     private void lancerEcoute() {
@@ -570,6 +638,10 @@ public class MainActivity extends Activity {
 
     private void remettreAZero() {
         compte = 0;
+        baseCompte = 0;
+        totalLibre = 0;
+        totalGuet = 0;
+        maxPartielLibre = 0;
         tempsCumule = 0;
         if (enEcoute) debutSegment = SystemClock.elapsedRealtime();
         historique.clear();
