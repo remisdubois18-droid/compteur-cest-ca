@@ -23,6 +23,17 @@ jobs:
         with:
           gradle-version: '8.7'
 
+      - name: Récupérer le modèle de reconnaissance français (hors connexion)
+        run: |
+          curl -sSL -o modele.zip https://alphacephei.com/vosk/models/vosk-model-small-fr-0.22.zip
+          unzip -q modele.zip
+          mkdir -p app/src/main/assets
+          mv vosk-model-small-fr-0.22 app/src/main/assets/model-fr
+          uuidgen > app/src/main/assets/model-fr/uuid
+          echo "--- Mots du vocabulaire contenant c'est / ça :"
+          find app/src/main/assets/model-fr -name 'words.txt' -exec grep -E "^(c'est|c'|ça|sa|ca|est) " {} \; || true
+          ls -R app/src/main/assets/model-fr | head -40
+
       - name: Compiler l'application
         run: gradle :app:assembleDebug --no-daemon --stacktrace
 

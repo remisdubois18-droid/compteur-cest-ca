@@ -30,8 +30,18 @@ import android.view.WindowManager;
 import android.widget.Button;
 import android.widget.CheckBox;
 import android.widget.LinearLayout;
+import android.widget.RadioButton;
+import android.widget.RadioGroup;
 import android.widget.ScrollView;
 import android.widget.TextView;
+
+import org.json.JSONObject;
+import org.vosk.LibVosk;
+import org.vosk.LogLevel;
+import org.vosk.Model;
+import org.vosk.Recognizer;
+import org.vosk.android.SpeechService;
+import org.vosk.android.StorageService;
 
 import java.util.ArrayList;
 import java.util.Locale;
@@ -48,14 +58,23 @@ public class MainActivity extends Activity {
     private static final int ROUGE = Color.parseColor("#e5484d");
     private static final int DOUX = Color.parseColor("#a9adc9");
 
-    // c'est ça / c'est sa / cest ça / c est ca ...
+    // c'est ça / c'est sa / cest ça / s'est ça / sait ça / ces ça / cé ça ...
     private static final Pattern MOTIF = Pattern.compile(
-            "\\bc\\s*['’]?\\s*est\\s+(ça|ca|sa)\\b",
+            "\\b(?:[cs]\\s*['’]?\\s*est|sait|ses|ces|cé)\\s*(?:ça|ca|sa)\\b",
             Pattern.CASE_INSENSITIVE | Pattern.UNICODE_CASE);
 
     private TextView txtNombre, txtEtat, txtDuree, txtRythme, txtTexte;
     private Button btnDemarrer;
     private CheckBox optVibre, optSilence;
+    private RadioButton modeHorsLigne, modeGoogle;
+
+    // Moteur hors connexion (Vosk)
+    private Model modeleVosk;
+    private SpeechService serviceVosk;
+    private boolean chargementModele = false;
+
+    // Moteur Google : meilleur nombre vu dans les résultats provisoires de la phrase en cours
+    private int maxProvisoire = 0;
     private GradientDrawable fondCercle;
 
     private SpeechRecognizer reco;
@@ -110,6 +129,23 @@ public class MainActivity extends Activity {
         titre.setTextColor(DOUX);
         titre.setTextSize(18);
         racine.addView(titre);
+
+        RadioGroup choixMoteur = new RadioGroup(this);
+        choixMoteur.setOrientation(RadioGroup.VERTICAL);
+        modeHorsLigne = new RadioButton(this);
+        modeHorsLigne.setText("Hors connexion – écoute continue, conseillé à plusieurs");
+        modeHorsLigne.setTextColor(Color.WHITE);
+        modeHorsLigne.setId(View.generateViewId());
+        modeGoogle = new RadioButton(this);
+        modeGoogle.setText("Google – affiche tout le texte entendu");
+        modeGoogle.setTextColor(Color.WHITE);
+        modeGoogle.setId(View.generateViewId());
+        choixMoteur.addView(modeHorsLigne);
+        choixMoteur.addView(modeGoogle);
+        choixMoteur.check(modeHorsLigne.getId());
+        LinearLayout.LayoutParams pm = new LinearLayout.LayoutParams(-1, -2);
+        pm.topMargin = dp(10);
+        racine.addView(choixMoteur, pm);
 
         // Cercle du compteur
         LinearLayout cercle = new LinearLayout(this);
@@ -264,6 +300,7 @@ public class MainActivity extends Activity {
     }
 
     private void demarrer() {
+        if (modeHorsLigne.isChecked()) { demarrerHorsLigne(); return; }
         if (!SpeechRecognizer.isRecognitionAvailable(this)) {
             txtEtat.setText("Aucun service de reconnaissance vocale sur ce téléphone (installez ou activez l'application Google).");
             txtEtat.setTextColor(ROUGE);
@@ -276,14 +313,22 @@ public class MainActivity extends Activity {
             intentReco.putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM);
             intentReco.putExtra(RecognizerIntent.EXTRA_LANGUAGE, "fr-FR");
             intentReco.putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true);
+            intentReco.putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 5);
             intentReco.putExtra(RecognizerIntent.EXTRA_PREFER_OFFLINE, true);
             intentReco.putExtra(RecognizerIntent.EXTRA_CALLING_PACKAGE, getPackageName());
             intentReco.putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS, 2000L);
             intentReco.putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_POSSIBLY_COMPLETE_SILENCE_LENGTH_MILLIS, 2000L);
         }
+        passerEnEcoute(optSilence.isChecked());
+        lancerEcoute();
+    }
+
+    private void passerEnEcoute(boolean couper) {
         enEcoute = true;
         debutSegment = SystemClock.elapsedRealtime();
-        couperSon(optSilence.isChecked());
+        couperSon(couper);
+        modeHorsLigne.setEnabled(false);
+        modeGoogle.setEnabled(false);
         getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
         btnDemarrer.setText("■  Arrêter");
         btnDemarrer.setBackground(arrondi(ROUGE, 16));
@@ -291,7 +336,78 @@ public class MainActivity extends Activity {
         txtEtat.setText("● J'écoute…");
         txtEtat.setTextColor(VERT);
         handler.post(tic);
-        lancerEcoute();
+    }
+
+    // ---------- Moteur hors connexion ----------
+
+    private void demarrerHorsLigne() {
+        if (modeleVosk != null) { ecouterHorsLigne(); return; }
+        if (chargementModele) return;
+        chargementModele = true;
+        txtEtat.setText("Préparation du moteur hors connexion… (quelques secondes la première fois)");
+        txtEtat.setTextColor(ACCENT);
+        btnDemarrer.setEnabled(false);
+        LibVosk.setLogLevel(LogLevel.WARNINGS);
+        StorageService.unpack(this, "model-fr", "model",
+                modele -> {
+                    modeleVosk = modele;
+                    chargementModele = false;
+                    btnDemarrer.setEnabled(true);
+                    ecouterHorsLigne();
+                },
+                erreur -> {
+                    chargementModele = false;
+                    btnDemarrer.setEnabled(true);
+                    txtEtat.setText("Impossible de préparer le moteur hors connexion : " + erreur.getMessage());
+                    txtEtat.setTextColor(ROUGE);
+                });
+    }
+
+    private void ecouterHorsLigne() {
+        try {
+            // On ne guette que l'expression : tout le reste est classé « inconnu »
+            String grammaire = "[\"c'est ça\", \"c' est ça\", \"s'est ça\", \"[unk]\"]";
+            Recognizer rec = new Recognizer(modeleVosk, 16000.0f, grammaire);
+            serviceVosk = new SpeechService(rec, 16000.0f);
+            serviceVosk.startListening(ecouteurHorsLigne);
+            passerEnEcoute(false);
+            txtTexte.setText("Mode hors connexion : seuls les « c'est ça » détectés s'affichent ici.");
+        } catch (Exception e) {
+            txtEtat.setText("Erreur du micro : " + e.getMessage());
+            txtEtat.setTextColor(ROUGE);
+        }
+    }
+
+    private void arreterHorsLigne() {
+        if (serviceVosk != null) {
+            try { serviceVosk.stop(); serviceVosk.shutdown(); } catch (Exception ignored) { }
+            serviceVosk = null;
+        }
+    }
+
+    private final org.vosk.android.RecognitionListener ecouteurHorsLigne = new org.vosk.android.RecognitionListener() {
+        @Override public void onPartialResult(String hypothese) { }
+        @Override public void onResult(String hypothese) { traiterHorsLigne(hypothese); }
+        @Override public void onFinalResult(String hypothese) { traiterHorsLigne(hypothese); }
+        @Override public void onError(Exception e) {
+            txtEtat.setText("Erreur : " + e.getMessage());
+            txtEtat.setTextColor(ROUGE);
+        }
+        @Override public void onTimeout() { }
+    };
+
+    private void traiterHorsLigne(String json) {
+        if (!enEcoute) return;
+        String texte;
+        try { texte = new JSONObject(json).optString("text", ""); } catch (Exception e) { return; }
+        int n = compter(texte);
+        if (n > 0) {
+            ajouter(n);
+            String heure = String.format(Locale.FRANCE, "%tH:%<tM:%<tS", new java.util.Date());
+            historique.add(heure + "  c'est ça" + (n > 1 ? " ×" + n : ""));
+            if (historique.size() > 40) historique.remove(0);
+            afficherTexte("");
+        }
     }
 
     private void lancerEcoute() {
@@ -311,6 +427,10 @@ public class MainActivity extends Activity {
         if (reco != null) {
             try { reco.cancel(); } catch (Exception ignored) { }
         }
+        arreterHorsLigne();
+        maxProvisoire = 0;
+        modeHorsLigne.setEnabled(true);
+        modeGoogle.setEnabled(true);
         couperSon(false);
         getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
         btnDemarrer.setText("▶  Démarrer");
@@ -342,6 +462,7 @@ public class MainActivity extends Activity {
 
         @Override public void onError(int erreur) {
             if (!enEcoute) return;
+            if (maxProvisoire > 0) { ajouter(maxProvisoire); maxProvisoire = 0; }
             if (erreur == SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS) {
                 arreter();
                 txtEtat.setText("Accès au micro refusé.");
@@ -359,16 +480,19 @@ public class MainActivity extends Activity {
 
         @Override public void onPartialResults(Bundle partiels) {
             ArrayList<String> r = partiels.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION);
+            if (r != null) for (String t : r) maxProvisoire = Math.max(maxProvisoire, compter(t));
             afficherTexte(r != null && !r.isEmpty() ? r.get(0) : "");
         }
 
         @Override public void onResults(Bundle resultats) {
             ArrayList<String> r = resultats.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION);
+            int meilleur = maxProvisoire;
+            maxProvisoire = 0;
+            if (r != null) for (String t : r) meilleur = Math.max(meilleur, compter(t));
+            if (meilleur > 0) ajouter(meilleur);
             if (r != null && !r.isEmpty()) {
                 String phrase = r.get(0).trim();
                 if (!phrase.isEmpty()) {
-                    int n = compter(phrase);
-                    if (n > 0) ajouter(n);
                     historique.add(phrase);
                     if (historique.size() > 40) historique.remove(0);
                 }
@@ -459,6 +583,8 @@ public class MainActivity extends Activity {
         enEcoute = false;
         handler.removeCallbacksAndMessages(null);
         couperSon(false);
+        arreterHorsLigne();
+        if (modeleVosk != null) { modeleVosk.close(); modeleVosk = null; }
         if (reco != null) {
             try { reco.destroy(); } catch (Exception ignored) { }
             reco = null;
