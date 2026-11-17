@@ -33,6 +33,8 @@ jobs:
       - name: Fabriquer le programme
         run: >
           pyinstaller --noconfirm --windowed --name CompteurCestCa
+          --exclude-module torch --exclude-module transformers --exclude-module tensorboard
+          --exclude-module sympy --exclude-module scipy --exclude-module pandas --exclude-module matplotlib
           --collect-data faster_whisper
           --collect-binaries ctranslate2
           --collect-binaries onnxruntime
