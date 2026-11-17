@@ -1,23 +1,22 @@
 package fr.volumeclicker;
 
+import android.Manifest;
 import android.app.Activity;
 import android.app.AlertDialog;
-import android.content.Context;
 import android.content.Intent;
 import android.content.SharedPreferences;
+import android.content.pm.PackageManager;
 import android.graphics.Color;
+import android.net.Uri;
+import android.os.Build;
 import android.os.Bundle;
 import android.provider.Settings;
 import android.view.Gravity;
 import android.view.KeyEvent;
-import android.view.View;
-import android.view.accessibility.AccessibilityManager;
-import android.accessibilityservice.AccessibilityServiceInfo;
 import android.widget.Button;
 import android.widget.LinearLayout;
 import android.widget.ScrollView;
 import android.widget.TextView;
-import java.util.List;
 import java.util.Locale;
 
 public class MainActivity extends Activity {
@@ -27,8 +26,8 @@ public class MainActivity extends Activity {
     private final SharedPreferences.OnSharedPreferenceChangeListener listener =
         (p, key) -> runOnUiThread(this::refresh);
 
-    @Override public void onCreate(Bundle state) {
-        super.onCreate(state);
+    @Override public void onCreate(Bundle savedInstanceState) {
+        super.onCreate(savedInstanceState);
         preferences=Counters.prefs(this);
         render();
         refresh();
@@ -43,93 +42,114 @@ public class MainActivity extends Activity {
         super.onPause();
     }
 
-    private boolean accessibilityEnabled() {
-        AccessibilityManager manager=(AccessibilityManager)getSystemService(Context.ACCESSIBILITY_SERVICE);
-        if(manager==null) return false;
-        List<AccessibilityServiceInfo> list=manager.getEnabledAccessibilityServiceList(AccessibilityServiceInfo.FEEDBACK_ALL_MASK);
-        String name=getPackageName()+"/"+VolumeAccessibilityService.class.getName();
-        for(AccessibilityServiceInfo info:list) if(name.equals(info.getId())) return true;
-        return false;
-    }
-    @Override public boolean dispatchKeyEvent(KeyEvent event) {
-        int key=event.getKeyCode();
-        if((key==KeyEvent.KEYCODE_VOLUME_UP || key==KeyEvent.KEYCODE_VOLUME_DOWN) && Counters.running(this)) {
-            if(!accessibilityEnabled() && event.getAction()==KeyEvent.ACTION_DOWN && event.getRepeatCount()==0) {
-                Counters.increment(this,key==KeyEvent.KEYCODE_VOLUME_UP);
+    @Override public boolean dispatchKeyEvent(KeyEvent e) {
+        int code=e.getKeyCode();
+        if((code==KeyEvent.KEYCODE_VOLUME_UP || code==KeyEvent.KEYCODE_VOLUME_DOWN) && Counters.running(this)) {
+            if(e.getAction()==KeyEvent.ACTION_DOWN && e.getRepeatCount()==0) {
+                Counters.increment(this,code==KeyEvent.KEYCODE_VOLUME_UP);
                 refresh();
             }
             return true;
         }
-        return super.dispatchKeyEvent(event);
+        return super.dispatchKeyEvent(e);
     }
+
     private TextView label(String text,int size,int color) {
-        TextView v=new TextView(this);
-        v.setText(text); v.setTextSize(size); v.setTextColor(color); v.setGravity(Gravity.CENTER);
-        v.setPadding(8,12,8,12);
-        return v;
+        TextView view=new TextView(this);
+        view.setText(text);
+        view.setTextSize(size);
+        view.setTextColor(color);
+        view.setGravity(Gravity.CENTER);
+        view.setPadding(8,12,8,12);
+        return view;
     }
     private Button button(String text,LinearLayout root) {
         Button b=new Button(this);
-        b.setText(text); b.setAllCaps(false);
+        b.setText(text);
+        b.setAllCaps(false);
         root.addView(b,new LinearLayout.LayoutParams(-1,-2));
         return b;
     }
-    private TextView counter(LinearLayout root,String title,int accent) {
-        root.addView(label(title,17,accent));
-        TextView n=label("0",50,Color.WHITE);
-        root.addView(n);
-        return n;
+    private TextView counter(LinearLayout root,String name,int accent) {
+        root.addView(label(name,17,accent));
+        TextView count=label("0",49,Color.WHITE);
+        root.addView(count);
+        return count;
     }
     private void render() {
-        int bg=Color.rgb(12,18,32), muted=Color.rgb(171,189,209);
+        int bg=Color.rgb(12,18,32);
+        int muted=Color.rgb(178,191,207);
         ScrollView scroll=new ScrollView(this);
         scroll.setBackgroundColor(bg);
         LinearLayout root=new LinearLayout(this);
         root.setOrientation(LinearLayout.VERTICAL);
-        root.setPadding(40,40,40,40);
+        root.setPadding(36,40,36,32);
         root.setGravity(Gravity.CENTER_HORIZONTAL);
         scroll.addView(root);
-        root.addView(label("VOLUME CLICKER",26,Color.WHITE));
-        root.addView(label("Compteur physique, y compris en arrière-plan",14,muted));
+        root.addView(label("VOLUME CLICKER",25,Color.WHITE));
+        root.addView(label("Touches physiques • compteur local",14,muted));
         up=counter(root,"VOLUME +",Color.CYAN);
-        down=counter(root,"VOLUME −",Color.rgb(183,146,255));
+        down=counter(root,"VOLUME −",Color.rgb(185,156,255));
         total=counter(root,"TOTAL",Color.WHITE);
-        status=label("",14,muted);
+        status=label("",15,muted);
         root.addView(status);
         toggle=button("DÉMARRER LE COMPTAGE",root);
-        toggle.setOnClickListener(v -> {
-            Counters.setRunning(this,!Counters.running(this));
-            refresh();
-            if(Counters.running(this) && !accessibilityEnabled())
-                new AlertDialog.Builder(this)
-                    .setTitle("Activer le service d'accessibilité")
-                    .setMessage("Pour compter pendant l'utilisation d'autres applications, active Volume Clicker dans les paramètres d'accessibilité. Écran éteint : non garanti selon le téléphone.")
-                    .setNegativeButton("Plus tard",null)
-                    .setPositiveButton("Paramètres",(d,w)->openSettings())
-                    .show();
-        });
-        button("OUVRIR LES PARAMÈTRES D'ACCESSIBILITÉ",root)
-            .setOnClickListener(v->openSettings());
-        button("RÉINITIALISER",root).setOnClickListener(v->
+        toggle.setOnClickListener(v -> toggleCounting());
+
+        button("PARAMÈTRES BATTERIE / APPLICATION",root).setOnClickListener(v ->
             new AlertDialog.Builder(this)
-                .setTitle("Remettre les compteurs à zéro ?")
+                .setTitle("Autoriser le fonctionnement en arrière-plan")
+                .setMessage("Sur OPPO/ColorOS, ouvre les informations de Volume Clicker puis, si disponibles, autorise l'activité en arrière-plan et règle la batterie sur « Sans restriction ». Les libellés dépendent de ColorOS.")
                 .setNegativeButton("Annuler",null)
-                .setPositiveButton("Réinitialiser",(d,w)->{Counters.reset(this);refresh();})
+                .setPositiveButton("Ouvrir",(d,w)->{
+                    Intent i=new Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                        Uri.parse("package:"+getPackageName()));
+                    startActivity(i);
+                }).show());
+
+        button("REMETTRE LES COMPTEURS À ZÉRO",root).setOnClickListener(v ->
+            new AlertDialog.Builder(this)
+                .setTitle("Réinitialiser les compteurs ?")
+                .setNegativeButton("Annuler",null)
+                .setPositiveButton("Oui",(d,w)->{Counters.reset(this);refresh();})
                 .show());
-        root.addView(label("Un appui long = 1. Le volume système ne change pas pendant le comptage. Capture écran verrouillé ou éteint non garantie.",12,muted));
+
+        root.addView(label("Le mode arrière-plan est expérimental : une session multimédia intercepte les réglages de volume. Cela peut empêcher le réglage du volume d'autres applications pendant le comptage. Écran verrouillé ou éteint : non garanti selon ColorOS. Un appui prolongé peut générer plusieurs incréments.",12,muted));
         setContentView(scroll);
     }
-    private void openSettings() {
-        startActivity(new Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS));
+
+    private void toggleCounting() {
+        if(Counters.running(this)) {
+            Intent i=new Intent(this,ButtonCounterService.class).setAction(ButtonCounterService.STOP);
+            startService(i);
+            Counters.setRunning(this,false);
+            refresh();
+        } else {
+            if(Build.VERSION.SDK_INT>=33 &&
+               checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS)!=PackageManager.PERMISSION_GRANTED) {
+                requestPermissions(new String[]{Manifest.permission.POST_NOTIFICATIONS},101);
+            }
+            Intent i=new Intent(this,ButtonCounterService.class).setAction(ButtonCounterService.START);
+            try {
+                if(Build.VERSION.SDK_INT>=26) startForegroundService(i);
+                else startService(i);
+            } catch(RuntimeException exception) {
+                new AlertDialog.Builder(this).setTitle("Démarrage impossible")
+                    .setMessage("Android a empêché le démarrage du service : "+exception.getMessage())
+                    .setPositiveButton("OK",null).show();
+            }
+        }
     }
+
     private void refresh() {
         if(up==null) return;
-        long u=preferences.getLong(Counters.UP,0),d=preferences.getLong(Counters.DOWN,0);
+        long u=preferences.getLong(Counters.UP,0L);
+        long d=preferences.getLong(Counters.DOWN,0L);
         up.setText(String.format(Locale.FRANCE,"%,d",u));
         down.setText(String.format(Locale.FRANCE,"%,d",d));
         total.setText(String.format(Locale.FRANCE,"%,d",u+d));
-        boolean active=Counters.running(this);
-        status.setText(active ? (accessibilityEnabled() ? "● Comptage actif en arrière-plan" : "● Active le service d'accessibilité") : "○ Comptage arrêté");
-        toggle.setText(active?"ARRÊTER LE COMPTAGE":"DÉMARRER LE COMPTAGE");
+        boolean enabled=Counters.running(this);
+        status.setText(enabled?"● Comptage démarré — mode arrière-plan expérimental":"○ Comptage arrêté");
+        toggle.setText(enabled?"ARRÊTER LE COMPTAGE":"DÉMARRER LE COMPTAGE");
     }
 }
