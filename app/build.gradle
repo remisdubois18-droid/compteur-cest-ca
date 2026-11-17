@@ -10,21 +10,58 @@ android {
         applicationId 'fr.remis.cestca'
         minSdk 24
         targetSdk 34
-        versionCode 4
-        versionName '1.4'
+        versionCode 5
+        versionName '2.0'
         ndk {
-            abiFilters 'arm64-v8a', 'armeabi-v7a'
+            // Whisper n'est utilisable que sur les téléphones 64 bits (quasiment tous depuis 2017)
+            abiFilters 'arm64-v8a'
         }
+        externalNativeBuild {
+            cmake {
+                arguments '-DANDROID_STL=c++_static'
+            }
+        }
+    }
+
+    // Signature fixe : chaque nouvelle version s'installe par-dessus la précédente
+    signingConfigs {
+        fixe {
+            storeFile file('cle-signature.jks')
+            storePassword 'cestca2026'
+            keyAlias 'cestca'
+            keyPassword 'cestca2026'
+        }
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled false
+            signingConfig signingConfigs.fixe
+        }
+        debug {
+            signingConfig signingConfigs.fixe
+        }
+    }
+
+    externalNativeBuild {
+        cmake {
+            path 'src/main/cpp/CMakeLists.txt'
+            version '3.22.1'
+        }
+    }
+
+    // Les modèles ne doivent pas être compressés dans l'APK (copie plus rapide)
+    androidResources {
+        noCompress 'bin'
+    }
+
+    lint {
+        checkReleaseBuilds false
+        abortOnError false
     }
 
     compileOptions {
         sourceCompatibility JavaVersion.VERSION_17
         targetCompatibility JavaVersion.VERSION_17
     }
-}
-
-dependencies {
-    // Reconnaissance vocale hors connexion
-    implementation 'com.alphacephei:vosk-android:0.3.47@aar'
-    implementation 'net.java.dev.jna:jna:5.13.0@aar'
 }

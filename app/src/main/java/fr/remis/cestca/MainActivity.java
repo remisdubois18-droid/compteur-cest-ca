@@ -5,6 +5,7 @@ import android.app.Activity;
 import android.content.Context;
 import android.content.Intent;
 import android.content.pm.PackageManager;
+import android.content.res.AssetFileDescriptor;
 import android.graphics.Color;
 import android.graphics.Typeface;
 import android.graphics.drawable.GradientDrawable;
@@ -38,21 +39,26 @@ import android.widget.RadioGroup;
 import android.widget.ScrollView;
 import android.widget.TextView;
 
-import org.json.JSONObject;
-import org.vosk.LibVosk;
-import org.vosk.LogLevel;
-import org.vosk.Model;
-import org.vosk.Recognizer;
-import org.vosk.android.StorageService;
-
+import java.io.File;
+import java.io.FileOutputStream;
+import java.io.InputStream;
+import java.io.OutputStream;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Locale;
+import java.util.concurrent.LinkedBlockingQueue;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 public class MainActivity extends Activity {
 
     private static final int DEMANDE_MICRO = 1;
+    private static final int FREQ = 16000;              // échantillons par seconde
+    private static final int BLOC = FREQ / 10;          // 0,1 seconde
+    private static final int TRANCHE_MAX = FREQ * 10;   // on analyse le son par tranches de 10 s au plus
+    private static final int TRANCHE_MIN = FREQ * 7;    // et on coupe dans un blanc entre 7 et 10 s
+
     private static final int FOND = Color.parseColor("#1b1f3b");
     private static final int CARTE = Color.parseColor("#262b52");
     private static final int ACCENT = Color.parseColor("#ffb703");
@@ -68,24 +74,9 @@ public class MainActivity extends Activity {
     private TextView txtNombre, txtEtat, txtDuree, txtRythme, txtTexte;
     private Button btnDemarrer;
     private CheckBox optVibre, optSilence;
-    private RadioButton modeHorsLigne, modeGoogle;
-
-    // Moteur hors connexion (Vosk)
-    private Model modeleVosk;
-    private Recognizer recLibre, recGuet;
-    private Thread filEcoute;
-    private int numeroSession = 0;
-    private java.util.concurrent.LinkedBlockingQueue<short[]> fileLibre, fileGuet;
-    private volatile boolean filActif = false;
-    private int baseCompte = 0, totalLibre = 0, totalGuet = 0, maxPartielLibre = 0;
-    private boolean chargementModele = false;
-
-    // Moteur Google : meilleur nombre vu dans les résultats provisoires de la phrase en cours
-    private int maxProvisoire = 0;
+    private RadioButton modePrecis, modeRapide, modeGoogle;
     private GradientDrawable fondCercle;
 
-    private SpeechRecognizer reco;
-    private Intent intentReco;
     private boolean enEcoute = false;
     private int compte = 0;
     private long tempsCumule = 0, debutSegment = 0;
@@ -93,6 +84,20 @@ public class MainActivity extends Activity {
     private final Handler handler = new Handler(Looper.getMainLooper());
     private AudioManager audio;
     private boolean sonCoupe = false;
+
+    // Moteur Whisper
+    private long ctxPrecis = 0, ctxRapide = 0;
+    private boolean chargement = false;
+    private volatile boolean micActif = false;
+    private int numeroSession = 0;
+    private volatile LinkedBlockingQueue<short[]> fileSon;
+    private volatile boolean analyseEnCours = false;
+    private static final Object VERROU = new Object(); // une seule analyse à la fois par moteur
+
+    // Moteur Google
+    private SpeechRecognizer reco;
+    private Intent intentReco;
+    private int maxProvisoire = 0;
 
     private final Runnable tic = new Runnable() {
         @Override public void run() {
@@ -109,6 +114,10 @@ public class MainActivity extends Activity {
         construireEcran();
     }
 
+    // =====================================================================
+    // Écran
+    // =====================================================================
+
     private int dp(float v) {
         return (int) TypedValue.applyDimension(TypedValue.COMPLEX_UNIT_DIP, v, getResources().getDisplayMetrics());
     }
@@ -118,6 +127,15 @@ public class MainActivity extends Activity {
         g.setColor(couleur);
         g.setCornerRadius(dp(rayon));
         return g;
+    }
+
+    private RadioButton choix(RadioGroup groupe, String texte) {
+        RadioButton r = new RadioButton(this);
+        r.setText(texte);
+        r.setTextColor(Color.WHITE);
+        r.setId(View.generateViewId());
+        groupe.addView(r);
+        return r;
     }
 
     private void construireEcran() {
@@ -139,22 +157,14 @@ public class MainActivity extends Activity {
 
         RadioGroup choixMoteur = new RadioGroup(this);
         choixMoteur.setOrientation(RadioGroup.VERTICAL);
-        modeHorsLigne = new RadioButton(this);
-        modeHorsLigne.setText("Hors connexion – écoute continue, conseillé à plusieurs");
-        modeHorsLigne.setTextColor(Color.WHITE);
-        modeHorsLigne.setId(View.generateViewId());
-        modeGoogle = new RadioButton(this);
-        modeGoogle.setText("Google – affiche tout le texte entendu");
-        modeGoogle.setTextColor(Color.WHITE);
-        modeGoogle.setId(View.generateViewId());
-        choixMoteur.addView(modeHorsLigne);
-        choixMoteur.addView(modeGoogle);
-        choixMoteur.check(modeHorsLigne.getId());
+        modePrecis = choix(choixMoteur, "Précis – Whisper (recommandé, sans internet)");
+        modeRapide = choix(choixMoteur, "Rapide – Whisper léger (téléphone ancien)");
+        modeGoogle = choix(choixMoteur, "Google – texte en direct, moins fiable à plusieurs");
+        choixMoteur.check(modePrecis.getId());
         LinearLayout.LayoutParams pm = new LinearLayout.LayoutParams(-1, -2);
         pm.topMargin = dp(10);
         racine.addView(choixMoteur, pm);
 
-        // Cercle du compteur
         LinearLayout cercle = new LinearLayout(this);
         cercle.setOrientation(LinearLayout.VERTICAL);
         cercle.setGravity(Gravity.CENTER);
@@ -163,14 +173,14 @@ public class MainActivity extends Activity {
         fondCercle.setColor(CARTE);
         fondCercle.setStroke(dp(6), Color.parseColor("#343a6b"));
         cercle.setBackground(fondCercle);
-        LinearLayout.LayoutParams pc = new LinearLayout.LayoutParams(dp(260), dp(260));
-        pc.topMargin = dp(20);
+        LinearLayout.LayoutParams pc = new LinearLayout.LayoutParams(dp(240), dp(240));
+        pc.topMargin = dp(14);
         racine.addView(cercle, pc);
 
         txtNombre = new TextView(this);
         txtNombre.setText("0");
         txtNombre.setTextColor(ACCENT);
-        txtNombre.setTextSize(96);
+        txtNombre.setTextSize(90);
         txtNombre.setTypeface(Typeface.DEFAULT_BOLD);
         txtNombre.setGravity(Gravity.CENTER);
         cercle.addView(txtNombre);
@@ -187,14 +197,13 @@ public class MainActivity extends Activity {
         txtEtat.setTextSize(15);
         txtEtat.setGravity(Gravity.CENTER);
         LinearLayout.LayoutParams pe = new LinearLayout.LayoutParams(-1, -2);
-        pe.topMargin = dp(14);
+        pe.topMargin = dp(12);
         racine.addView(txtEtat, pe);
 
-        // Boutons
         LinearLayout boutons = new LinearLayout(this);
         boutons.setOrientation(LinearLayout.HORIZONTAL);
         LinearLayout.LayoutParams pb = new LinearLayout.LayoutParams(-1, -2);
-        pb.topMargin = dp(16);
+        pb.topMargin = dp(14);
         racine.addView(boutons, pb);
 
         btnDemarrer = new Button(this);
@@ -218,31 +227,28 @@ public class MainActivity extends Activity {
         boutons.addView(btnZero, new LinearLayout.LayoutParams(0, dp(64), 1f));
         btnZero.setOnClickListener(v -> remettreAZero());
 
-        // Statistiques
         LinearLayout stats = new LinearLayout(this);
         stats.setOrientation(LinearLayout.HORIZONTAL);
         LinearLayout.LayoutParams ps = new LinearLayout.LayoutParams(-1, -2);
-        ps.topMargin = dp(14);
+        ps.topMargin = dp(12);
         racine.addView(stats, ps);
         txtDuree = ajouterStat(stats, "00:00", "durée d'écoute", true);
         txtRythme = ajouterStat(stats, "–", "par minute", false);
 
-        // Options
         optVibre = new CheckBox(this);
         optVibre.setText("Vibrer à chaque « c'est ça »");
         optVibre.setTextColor(DOUX);
         optVibre.setChecked(true);
         LinearLayout.LayoutParams po = new LinearLayout.LayoutParams(-1, -2);
-        po.topMargin = dp(10);
+        po.topMargin = dp(8);
         racine.addView(optVibre, po);
 
         optSilence = new CheckBox(this);
-        optSilence.setText("Couper le petit bip de relance de l'écoute");
+        optSilence.setText("Mode Google : couper le bip de relance");
         optSilence.setTextColor(DOUX);
         optSilence.setChecked(true);
         racine.addView(optSilence, new LinearLayout.LayoutParams(-1, -2));
 
-        // Texte entendu
         txtTexte = new TextView(this);
         txtTexte.setText("Le texte entendu s'affichera ici.");
         txtTexte.setTextColor(DOUX);
@@ -252,7 +258,7 @@ public class MainActivity extends Activity {
         txtTexte.setBackground(arrondi(CARTE, 14));
         txtTexte.setMinHeight(dp(90));
         LinearLayout.LayoutParams pt = new LinearLayout.LayoutParams(-1, -2);
-        pt.topMargin = dp(12);
+        pt.topMargin = dp(10);
         racine.addView(txtTexte, pt);
 
         setContentView(defilement);
@@ -283,7 +289,14 @@ public class MainActivity extends Activity {
         return v;
     }
 
-    // ---------- Micro et reconnaissance ----------
+    private void etat(String texte, int couleur) {
+        txtEtat.setText(texte);
+        txtEtat.setTextColor(couleur);
+    }
+
+    // =====================================================================
+    // Démarrage / arrêt
+    // =====================================================================
 
     private void demanderPuisDemarrer() {
         if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
@@ -297,25 +310,255 @@ public class MainActivity extends Activity {
     public void onRequestPermissionsResult(int code, String[] permissions, int[] resultats) {
         super.onRequestPermissionsResult(code, permissions, resultats);
         if (code == DEMANDE_MICRO) {
-            if (resultats.length > 0 && resultats[0] == PackageManager.PERMISSION_GRANTED) {
-                demarrer();
-            } else {
-                txtEtat.setText("Accès au micro refusé. Autorisez-le dans Paramètres › Applications › C'est ça.");
-                txtEtat.setTextColor(ROUGE);
-            }
+            if (resultats.length > 0 && resultats[0] == PackageManager.PERMISSION_GRANTED) demarrer();
+            else etat("Accès au micro refusé. Autorisez-le dans Paramètres › Applications › C'est ça.", ROUGE);
         }
     }
 
     private void demarrer() {
-        if (modeHorsLigne.isChecked()) { demarrerHorsLigne(); return; }
+        if (modeGoogle.isChecked()) demarrerGoogle();
+        else demarrerWhisper(modePrecis.isChecked());
+    }
+
+    private void passerEnEcoute(boolean couper) {
+        enEcoute = true;
+        debutSegment = SystemClock.elapsedRealtime();
+        couperSon(couper);
+        modePrecis.setEnabled(false);
+        modeRapide.setEnabled(false);
+        modeGoogle.setEnabled(false);
+        getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+        btnDemarrer.setText("■  Arrêter");
+        btnDemarrer.setBackground(arrondi(ROUGE, 16));
+        fondCercle.setStroke(dp(6), VERT);
+        etat("● J'écoute…", VERT);
+        handler.removeCallbacks(tic);
+        handler.post(tic);
+    }
+
+    private void arreter() {
+        if (enEcoute) tempsCumule += SystemClock.elapsedRealtime() - debutSegment;
+        enEcoute = false;
+        handler.removeCallbacks(tic);
+        micActif = false;  // Whisper : on coupe le micro, l'analyse du son déjà enregistré continue
+        if (reco != null) {
+            try { reco.cancel(); } catch (Exception ignored) { }
+        }
+        maxProvisoire = 0;
+        couperSon(false);
+        modePrecis.setEnabled(true);
+        modeRapide.setEnabled(true);
+        modeGoogle.setEnabled(true);
+        getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+        btnDemarrer.setText("▶  Démarrer");
+        btnDemarrer.setBackground(arrondi(VERT, 16));
+        fondCercle.setStroke(dp(6), Color.parseColor("#343a6b"));
+        if (analyseEnCours || (fileSon != null && !fileSon.isEmpty())) etat("● Arrêté – fin de l'analyse en cours…", ACCENT);
+        else etat("● À l'arrêt", DOUX);
+        majDuree();
+    }
+
+    // =====================================================================
+    // Moteur Whisper
+    // =====================================================================
+
+    private void demarrerWhisper(boolean precis) {
+        long ctx = precis ? ctxPrecis : ctxRapide;
+        if (ctx != 0) { ecouterWhisper(ctx); return; }
+        if (chargement) return;
+        chargement = true;
+        btnDemarrer.setEnabled(false);
+        etat("Préparation du moteur… (jusqu'à 30 s la première fois)", ACCENT);
+        final String nom = precis ? "ggml-small.bin" : "ggml-base.bin";
+        new Thread(() -> {
+            long c = 0;
+            String erreur = null;
+            try {
+                File f = copierModele(nom);
+                c = Whisper.charger(f.getAbsolutePath());
+                if (c == 0) erreur = "le modèle n'a pas pu être chargé";
+            } catch (Throwable t) {
+                erreur = t.getMessage();
+            }
+            final long resultat = c;
+            final String err = erreur;
+            handler.post(() -> {
+                chargement = false;
+                btnDemarrer.setEnabled(true);
+                if (err != null) { etat("Impossible de préparer le moteur : " + err, ROUGE); return; }
+                if (precis) ctxPrecis = resultat; else ctxRapide = resultat;
+                ecouterWhisper(resultat);
+            });
+        }, "chargement").start();
+    }
+
+    /** Copie le modèle depuis l'application vers la mémoire du téléphone (une seule fois). */
+    private File copierModele(String nom) throws Exception {
+        File dest = new File(getFilesDir(), nom);
+        long attendu = -1;
+        try (AssetFileDescriptor fd = getAssets().openFd("whisper/" + nom)) {
+            attendu = fd.getLength();
+        } catch (Exception ignored) { }
+        if (dest.exists() && (attendu < 0 || dest.length() == attendu)) return dest;
+        File tmp = new File(getFilesDir(), nom + ".tmp");
+        try (InputStream in = getAssets().open("whisper/" + nom);
+             OutputStream out = new FileOutputStream(tmp)) {
+            byte[] buf = new byte[1 << 20];
+            int n;
+            while ((n = in.read(buf)) > 0) out.write(buf, 0, n);
+        }
+        if (!tmp.renameTo(dest)) throw new Exception("copie du modèle impossible");
+        return dest;
+    }
+
+    private void ecouterWhisper(final long ctx) {
+        int taille = Math.max(AudioRecord.getMinBufferSize(FREQ, AudioFormat.CHANNEL_IN_MONO,
+                AudioFormat.ENCODING_PCM_16BIT), FREQ * 2 * 4);
+        final AudioRecord micro;
+        try {
+            // Micro « brut » : capte toute la pièce, pas seulement la personne qui tient le téléphone
+            micro = new AudioRecord(MediaRecorder.AudioSource.MIC, FREQ,
+                    AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT, taille);
+        } catch (SecurityException e) {
+            etat("Accès au micro refusé.", ROUGE);
+            return;
+        }
+        if (micro.getState() != AudioRecord.STATE_INITIALIZED) {
+            micro.release();
+            etat("Le micro est déjà utilisé par une autre application.", ROUGE);
+            return;
+        }
+
+        final int session = ++numeroSession;
+        final LinkedBlockingQueue<short[]> file = new LinkedBlockingQueue<>();
+        final short[] FIN = new short[0];
+        fileSon = file;
+        micActif = true;
+
+        // 1) Le micro : lit le son et le range, rien n'est jamais jeté
+        Thread filMicro = new Thread(() -> {
+            android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_URGENT_AUDIO);
+            micro.startRecording();
+            while (micActif) {
+                short[] bloc = new short[BLOC];
+                int n = micro.read(bloc, 0, bloc.length);
+                if (n <= 0) continue;
+                if (n < bloc.length) bloc = Arrays.copyOf(bloc, n);
+                file.offer(bloc);
+            }
+            try { micro.stop(); } catch (Exception ignored) { }
+            micro.release();
+            file.offer(FIN);
+        }, "micro");
+
+        // 2) L'analyse : découpe le son en tranches de 7 à 10 s (coupées dans un blanc) et les transcrit
+        Thread filAnalyse = new Thread(() -> {
+            int threads = Math.max(2, Math.min(4, Runtime.getRuntime().availableProcessors()));
+            float[] tampon = new float[TRANCHE_MAX * 3];
+            int n = 0;
+            try {
+                while (true) {
+                    short[] bloc = file.take();
+                    boolean fin = (bloc == FIN);
+                    if (!fin) {
+                        if (n + bloc.length > tampon.length) tampon = Arrays.copyOf(tampon, tampon.length * 2);
+                        for (short s : bloc) tampon[n++] = s / 32768f;
+                    }
+                    while (n >= TRANCHE_MAX) {
+                        int coupe = chercherBlanc(tampon, n);
+                        analyser(session, ctx, Arrays.copyOf(tampon, coupe), threads);
+                        System.arraycopy(tampon, coupe, tampon, 0, n - coupe);
+                        n -= coupe;
+                    }
+                    if (fin) {
+                        if (n > FREQ / 2) analyser(session, ctx, Arrays.copyOf(tampon, n), threads);
+                        break;
+                    }
+                }
+            } catch (InterruptedException ignored) {
+            } finally {
+                handler.post(() -> { if (!enEcoute && session == numeroSession) etat("● À l'arrêt", DOUX); });
+            }
+        }, "analyse");
+        filAnalyse.setPriority(Thread.MAX_PRIORITY);
+        filAnalyse.start();
+        filMicro.start();
+
+        passerEnEcoute(false);
+        txtTexte.setText("Le texte entendu s'affichera ici (par tranches de quelques secondes).");
+    }
+
+    /** Cherche le moment le plus calme entre 7 et 10 s pour ne pas couper un mot en deux. */
+    private static int chercherBlanc(float[] son, int n) {
+        int meilleur = Math.min(n, TRANCHE_MAX);
+        double plusCalme = Double.MAX_VALUE;
+        int pas = BLOC / 2;
+        for (int debut = TRANCHE_MIN; debut + BLOC <= Math.min(n, TRANCHE_MAX); debut += pas) {
+            double e = 0;
+            for (int i = debut; i < debut + BLOC; i++) e += son[i] * son[i];
+            if (e < plusCalme) { plusCalme = e; meilleur = debut + BLOC / 2; }
+        }
+        return meilleur;
+    }
+
+    /** Vrai s'il y a au moins un peu de son au-dessus du bruit de fond. */
+    private static boolean contientDuSon(float[] son) {
+        int blocsActifs = 0;
+        for (int debut = 0; debut + BLOC <= son.length; debut += BLOC) {
+            double e = 0;
+            for (int i = debut; i < debut + BLOC; i++) e += son[i] * son[i];
+            if (Math.sqrt(e / BLOC) > 0.004) blocsActifs++;
+        }
+        return blocsActifs >= 3;
+    }
+
+    private void analyser(int session, long ctx, float[] morceau, int threads) {
+        if (!contientDuSon(morceau)) return;
+        analyseEnCours = true;
+        // Le moteur ne traite que la durée réelle du morceau (beaucoup plus rapide)
+        int audioCtx = Math.min(1500, (int) (morceau.length / (float) FREQ * 50) + 64);
+        String texte;
+        try {
+            byte[] octets;
+            synchronized (VERROU) { octets = Whisper.transcrire(ctx, morceau, threads, audioCtx); }
+            texte = new String(octets, StandardCharsets.UTF_8).trim();
+        } finally {
+            analyseEnCours = false;
+        }
+        final String t = texte;
+        handler.post(() -> resultatWhisper(session, t));
+    }
+
+    private void resultatWhisper(int session, String texte) {
+        if (session != numeroSession || texte.isEmpty()) return;
+        // Whisper invente parfois ce genre de phrases sur du bruit : on les ignore
+        String bas = texte.toLowerCase(Locale.FRANCE);
+        if (bas.contains("sous-titr") || bas.contains("amara.org")) return;
+        int n = compter(texte);
+        if (n > 0) ajouter(n);
+        historique.add(texte);
+        if (historique.size() > 40) historique.remove(0);
+        afficherTexte("");
+        if (!enEcoute && !analyseEnCours && (fileSon == null || fileSon.isEmpty())) etat("● À l'arrêt", DOUX);
+    }
+
+    private double retardWhisper() {
+        LinkedBlockingQueue<short[]> f = fileSon;
+        return f == null ? 0 : f.size() / 10.0;
+    }
+
+    // =====================================================================
+    // Moteur Google
+    // =====================================================================
+
+    private void demarrerGoogle() {
         if (!SpeechRecognizer.isRecognitionAvailable(this)) {
-            txtEtat.setText("Aucun service de reconnaissance vocale sur ce téléphone (installez ou activez l'application Google).");
-            txtEtat.setTextColor(ROUGE);
+            etat("Aucun service de reconnaissance vocale Google sur ce téléphone.", ROUGE);
             return;
         }
         if (reco == null) {
             reco = SpeechRecognizer.createSpeechRecognizer(this);
-            reco.setRecognitionListener(ecouteur);
+            reco.setRecognitionListener(ecouteurGoogle);
             intentReco = new Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH);
             intentReco.putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM);
             intentReco.putExtra(RecognizerIntent.EXTRA_LANGUAGE, "fr-FR");
@@ -326,258 +569,22 @@ public class MainActivity extends Activity {
             intentReco.putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS, 2000L);
             intentReco.putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_POSSIBLY_COMPLETE_SILENCE_LENGTH_MILLIS, 2000L);
         }
+        numeroSession++;
         passerEnEcoute(optSilence.isChecked());
-        lancerEcoute();
+        lancerGoogle();
     }
 
-    private void passerEnEcoute(boolean couper) {
-        enEcoute = true;
-        debutSegment = SystemClock.elapsedRealtime();
-        couperSon(couper);
-        modeHorsLigne.setEnabled(false);
-        modeGoogle.setEnabled(false);
-        getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
-        btnDemarrer.setText("■  Arrêter");
-        btnDemarrer.setBackground(arrondi(ROUGE, 16));
-        fondCercle.setStroke(dp(6), VERT);
-        txtEtat.setText("● J'écoute…");
-        txtEtat.setTextColor(VERT);
-        handler.post(tic);
-    }
-
-    // ---------- Moteur hors connexion ----------
-
-    private void demarrerHorsLigne() {
-        if (modeleVosk != null) { ecouterHorsLigne(); return; }
-        if (chargementModele) return;
-        chargementModele = true;
-        txtEtat.setText("Préparation du moteur hors connexion… (quelques secondes la première fois)");
-        txtEtat.setTextColor(ACCENT);
-        btnDemarrer.setEnabled(false);
-        LibVosk.setLogLevel(LogLevel.WARNINGS);
-        StorageService.unpack(this, "model-fr", "model",
-                modele -> {
-                    modeleVosk = modele;
-                    chargementModele = false;
-                    btnDemarrer.setEnabled(true);
-                    ecouterHorsLigne();
-                },
-                erreur -> {
-                    chargementModele = false;
-                    btnDemarrer.setEnabled(true);
-                    txtEtat.setText("Impossible de préparer le moteur hors connexion : " + erreur.getMessage());
-                    txtEtat.setTextColor(ROUGE);
-                });
-    }
-
-    private void ecouterHorsLigne() {
-        try {
-            // Deux moteurs écoutent le même son :
-            //  - « libre » transcrit tout (bon pour les « c'est ça » pris dans une phrase)
-            //  - « guet » ne cherche que l'expression (bon pour les « c'est ça » isolés)
-            String grammaire = "[\"c'est ça\", \"c' est ça\", \"s'est ça\", \"[unk]\"]";
-            recLibre = new Recognizer(modeleVosk, 16000.0f);
-            recGuet = new Recognizer(modeleVosk, 16000.0f, grammaire);
-        } catch (Exception e) {
-            txtEtat.setText("Erreur du moteur : " + e.getMessage());
-            txtEtat.setTextColor(ROUGE);
-            return;
-        }
-
-        // Micro « brut » : capte toute la pièce, et pas seulement la personne qui tient le téléphone
-        int taille = Math.max(AudioRecord.getMinBufferSize(16000, AudioFormat.CHANNEL_IN_MONO,
-                AudioFormat.ENCODING_PCM_16BIT), 16000 * 2);
-        final AudioRecord micro;
-        try {
-            micro = new AudioRecord(MediaRecorder.AudioSource.MIC, 16000,
-                    AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT, taille);
-        } catch (SecurityException e) {
-            txtEtat.setText("Accès au micro refusé.");
-            txtEtat.setTextColor(ROUGE);
-            return;
-        }
-        if (micro.getState() != AudioRecord.STATE_INITIALIZED) {
-            micro.release();
-            txtEtat.setText("Le micro est déjà utilisé par une autre application.");
-            txtEtat.setTextColor(ROUGE);
-            return;
-        }
-
-        baseCompte = compte;
-        totalLibre = 0;
-        totalGuet = 0;
-        maxPartielLibre = 0;
-        filActif = true;
-        final int session = ++numeroSession;
-        final java.util.concurrent.LinkedBlockingQueue<short[]> fileLibre = new java.util.concurrent.LinkedBlockingQueue<>();
-        final java.util.concurrent.LinkedBlockingQueue<short[]> fileGuet = new java.util.concurrent.LinkedBlockingQueue<>();
-        final short[] FIN = new short[0];
-        this.fileLibre = fileLibre;
-        this.fileGuet = fileGuet;
-
-        // 1) Le micro : il ne fait QUE lire le son et le ranger. Rien n'est jamais jeté.
-        Thread filMicro = new Thread(() -> {
-            android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_URGENT_AUDIO);
-            micro.startRecording();
-            while (filActif) {
-                short[] bloc = new short[1600]; // 0,1 seconde
-                int n = micro.read(bloc, 0, bloc.length);
-                if (n <= 0) continue;
-                if (n < bloc.length) bloc = java.util.Arrays.copyOf(bloc, n);
-                fileLibre.offer(bloc);
-                fileGuet.offer(bloc);
-            }
-            try { micro.stop(); } catch (Exception ignored) { }
-            micro.release();
-            fileLibre.offer(FIN);
-            fileGuet.offer(FIN);
-        }, "micro");
-
-        // 2) Chaque moteur travaille de son côté, à son rythme, sur son propre cœur du processeur
-        final Recognizer libre = recLibre, guet = recGuet;
-        recLibre = null;
-        recGuet = null;
-        Thread filLibre = new Thread(() -> {
-            int compteur = 0;
-            try {
-                while (true) {
-                    short[] bloc = fileLibre.take();
-                    if (bloc == FIN) break;
-                    if (libre.acceptWaveForm(bloc, bloc.length)) {
-                        String r = libre.getResult();
-                        handler.post(() -> resultatLibre(session, r, true));
-                    } else if (++compteur % 4 == 0) { // texte provisoire 2 à 3 fois par seconde suffit
-                        String r = libre.getPartialResult();
-                        handler.post(() -> resultatLibre(session, r, false));
-                    }
-                }
-                String r = libre.getFinalResult();
-                handler.post(() -> resultatLibre(session, r, true));
-            } catch (InterruptedException ignored) {
-            } finally {
-                libre.close();
-            }
-        }, "moteur-libre");
-        Thread filGuet = new Thread(() -> {
-            try {
-                while (true) {
-                    short[] bloc = fileGuet.take();
-                    if (bloc == FIN) break;
-                    if (guet.acceptWaveForm(bloc, bloc.length)) {
-                        String r = guet.getResult();
-                        handler.post(() -> resultatGuet(session, r));
-                    }
-                }
-                String r = guet.getFinalResult();
-                handler.post(() -> resultatGuet(session, r));
-            } catch (InterruptedException ignored) {
-            } finally {
-                guet.close();
-            }
-        }, "moteur-guet");
-
-        filLibre.setPriority(Thread.MAX_PRIORITY);
-        filGuet.setPriority(Thread.MAX_PRIORITY);
-        filLibre.start();
-        filGuet.start();
-        filMicro.start();
-        filEcoute = filMicro;
-        passerEnEcoute(false);
-        txtTexte.setText("Le texte entendu s'affichera ici.");
-    }
-
-    private void arreterHorsLigne() {
-        // On coupe le micro ; les moteurs finissent tranquillement le son déjà enregistré
-        filActif = false;
-        filEcoute = null;
-    }
-
-    /** Retard de traitement, en secondes (son enregistré mais pas encore analysé). */
-    private double retardHorsLigne() {
-        int n = 0;
-        if (fileLibre != null) n = Math.max(n, fileLibre.size());
-        if (fileGuet != null) n = Math.max(n, fileGuet.size());
-        return n / 10.0;
-    }
-
-    private static String lireJson(String json, String cle) {
-        try { return new JSONObject(json).optString(cle, ""); } catch (Exception e) { return ""; }
-    }
-
-    private void resultatLibre(int session, String json, boolean definitif) {
-        if (session != numeroSession) return;
-        if (!definitif) {
-            String partiel = lireJson(json, "partial");
-            maxPartielLibre = Math.max(maxPartielLibre, compter(partiel));
-            afficherTexte(partiel);
-            return;
-        }
-        String texte = lireJson(json, "text").trim();
-        totalLibre += Math.max(compter(texte), maxPartielLibre);
-        maxPartielLibre = 0;
-        if (!texte.isEmpty()) {
-            historique.add(texte);
-            if (historique.size() > 40) historique.remove(0);
-        }
-        afficherTexte("");
-        majTotalHorsLigne();
-    }
-
-    private void resultatGuet(int session, String json) {
-        if (session != numeroSession) return;
-        totalGuet += compter(lireJson(json, "text"));
-        majTotalHorsLigne();
-    }
-
-    // On garde le meilleur des deux moteurs
-    private void majTotalHorsLigne() {
-        int cible = baseCompte + Math.max(totalLibre, totalGuet);
-        if (cible > compte) ajouter(cible - compte);
-    }
-
-    private void lancerEcoute() {
-        if (!enEcoute || reco == null) return;
+    private void lancerGoogle() {
+        if (!enEcoute || reco == null || !modeGoogle.isChecked()) return;
         try {
             reco.cancel();
             reco.startListening(intentReco);
         } catch (Exception e) {
-            handler.postDelayed(this::lancerEcoute, 500);
+            handler.postDelayed(this::lancerGoogle, 500);
         }
     }
 
-    private void arreter() {
-        if (enEcoute) tempsCumule += SystemClock.elapsedRealtime() - debutSegment;
-        enEcoute = false;
-        handler.removeCallbacksAndMessages(null);
-        if (reco != null) {
-            try { reco.cancel(); } catch (Exception ignored) { }
-        }
-        arreterHorsLigne();
-        maxProvisoire = 0;
-        modeHorsLigne.setEnabled(true);
-        modeGoogle.setEnabled(true);
-        couperSon(false);
-        getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
-        btnDemarrer.setText("▶  Démarrer");
-        btnDemarrer.setBackground(arrondi(VERT, 16));
-        fondCercle.setStroke(dp(6), Color.parseColor("#343a6b"));
-        txtEtat.setText("● À l'arrêt");
-        txtEtat.setTextColor(DOUX);
-        majDuree();
-    }
-
-    private void couperSon(boolean couper) {
-        if (audio == null || couper == sonCoupe) return;
-        int sens = couper ? AudioManager.ADJUST_MUTE : AudioManager.ADJUST_UNMUTE;
-        try {
-            audio.adjustStreamVolume(AudioManager.STREAM_MUSIC, sens, 0);
-            audio.adjustStreamVolume(AudioManager.STREAM_NOTIFICATION, sens, 0);
-            audio.adjustStreamVolume(AudioManager.STREAM_SYSTEM, sens, 0);
-            sonCoupe = couper;
-        } catch (Exception ignored) { }
-    }
-
-    private final RecognitionListener ecouteur = new RecognitionListener() {
+    private final RecognitionListener ecouteurGoogle = new RecognitionListener() {
         @Override public void onReadyForSpeech(Bundle params) { }
         @Override public void onBeginningOfSpeech() { }
         @Override public void onRmsChanged(float rmsdB) { }
@@ -590,17 +597,11 @@ public class MainActivity extends Activity {
             if (maxProvisoire > 0) { ajouter(maxProvisoire); maxProvisoire = 0; }
             if (erreur == SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS) {
                 arreter();
-                txtEtat.setText("Accès au micro refusé.");
-                txtEtat.setTextColor(ROUGE);
+                etat("Accès au micro refusé.", ROUGE);
                 return;
             }
-            if (erreur == SpeechRecognizer.ERROR_NETWORK || erreur == SpeechRecognizer.ERROR_NETWORK_TIMEOUT
-                    || erreur == SpeechRecognizer.ERROR_SERVER) {
-                txtEtat.setText("● J'écoute… (problème de réseau, nouvel essai)");
-            }
-            // Pas de parole, délai dépassé, service occupé : on relance simplement
             long pause = (erreur == SpeechRecognizer.ERROR_RECOGNIZER_BUSY) ? 600 : 150;
-            handler.postDelayed(MainActivity.this::lancerEcoute, pause);
+            handler.postDelayed(MainActivity.this::lancerGoogle, pause);
         }
 
         @Override public void onPartialResults(Bundle partiels) {
@@ -623,11 +624,24 @@ public class MainActivity extends Activity {
                 }
             }
             afficherTexte("");
-            if (enEcoute) handler.postDelayed(MainActivity.this::lancerEcoute, 100);
+            if (enEcoute) handler.postDelayed(MainActivity.this::lancerGoogle, 100);
         }
     };
 
-    // ---------- Comptage et affichage ----------
+    private void couperSon(boolean couper) {
+        if (audio == null || couper == sonCoupe) return;
+        int sens = couper ? AudioManager.ADJUST_MUTE : AudioManager.ADJUST_UNMUTE;
+        try {
+            audio.adjustStreamVolume(AudioManager.STREAM_MUSIC, sens, 0);
+            audio.adjustStreamVolume(AudioManager.STREAM_NOTIFICATION, sens, 0);
+            audio.adjustStreamVolume(AudioManager.STREAM_SYSTEM, sens, 0);
+            sonCoupe = couper;
+        } catch (Exception ignored) { }
+    }
+
+    // =====================================================================
+    // Comptage et affichage
+    // =====================================================================
 
     private static int compter(String t) {
         Matcher m = MOTIF.matcher(t.replace('’', '\''));
@@ -642,7 +656,7 @@ public class MainActivity extends Activity {
         fondCercle.setStroke(dp(6), ACCENT);
         txtNombre.animate().scaleX(1.12f).scaleY(1.12f).setDuration(110)
                 .withEndAction(() -> txtNombre.animate().scaleX(1f).scaleY(1f).setDuration(110).start()).start();
-        handler.postDelayed(() -> { if (enEcoute) fondCercle.setStroke(dp(6), VERT); }, 400);
+        handler.postDelayed(() -> fondCercle.setStroke(dp(6), enEcoute ? VERT : Color.parseColor("#343a6b")), 400);
         if (optVibre.isChecked()) {
             Vibrator vib = (Vibrator) getSystemService(Context.VIBRATOR_SERVICE);
             if (vib != null && vib.hasVibrator()) {
@@ -683,15 +697,10 @@ public class MainActivity extends Activity {
     }
 
     private void majDuree() {
-        if (enEcoute && modeHorsLigne.isChecked()) {
-            double r = retardHorsLigne();
-            if (r >= 1.5) {
-                txtEtat.setText(String.format(Locale.FRANCE, "● J'écoute… (analyse en retard de %.0f s, rien n'est perdu)", r));
-                txtEtat.setTextColor(ACCENT);
-            } else {
-                txtEtat.setText("● J'écoute… (analyse en temps réel)");
-                txtEtat.setTextColor(VERT);
-            }
+        if (enEcoute && !modeGoogle.isChecked()) {
+            double r = retardWhisper();
+            if (r >= 3) etat(String.format(Locale.FRANCE, "● J'écoute… (analyse en retard de %.0f s, rien n'est perdu)", r), ACCENT);
+            else etat("● J'écoute… (texte mis à jour toutes les ~10 s)", VERT);
         }
         long s = dureeTotale() / 1000;
         txtDuree.setText(String.format(Locale.FRANCE, "%02d:%02d", s / 60, s % 60));
@@ -705,8 +714,6 @@ public class MainActivity extends Activity {
 
     private void remettreAZero() {
         compte = 0;
-        baseCompte = -Math.max(totalLibre, totalGuet);
-        maxPartielLibre = 0;
         tempsCumule = 0;
         if (enEcoute) debutSegment = SystemClock.elapsedRealtime();
         historique.clear();
@@ -718,9 +725,9 @@ public class MainActivity extends Activity {
     @Override
     protected void onDestroy() {
         enEcoute = false;
+        micActif = false;
         handler.removeCallbacksAndMessages(null);
         couperSon(false);
-        arreterHorsLigne();
         if (reco != null) {
             try { reco.destroy(); } catch (Exception ignored) { }
             reco = null;

@@ -23,22 +23,21 @@ jobs:
         with:
           gradle-version: '8.7'
 
-      - name: Récupérer le modèle de reconnaissance français (hors connexion)
+      - name: Récupérer le moteur Whisper (whisper.cpp)
+        run: git clone --depth 1 --branch v1.7.5 https://github.com/ggml-org/whisper.cpp.git whisper.cpp
+
+      - name: Récupérer les modèles de reconnaissance Whisper
         run: |
-          curl -sSL -o modele.zip https://alphacephei.com/vosk/models/vosk-model-small-fr-0.22.zip
-          unzip -q modele.zip
-          mkdir -p app/src/main/assets
-          mv vosk-model-small-fr-0.22 app/src/main/assets/model-fr
-          uuidgen > app/src/main/assets/model-fr/uuid
-          echo "--- Mots du vocabulaire contenant c'est / ça :"
-          find app/src/main/assets/model-fr -name 'words.txt' -exec grep -E "^(c'est|c'|ça|sa|ca|est) " {} \; || true
-          ls -R app/src/main/assets/model-fr | head -40
+          mkdir -p app/src/main/assets/whisper
+          curl -sSfL -o app/src/main/assets/whisper/ggml-small.bin https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small-q8_0.bin
+          curl -sSfL -o app/src/main/assets/whisper/ggml-base.bin  https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base-q8_0.bin
+          ls -la app/src/main/assets/whisper
 
       - name: Compiler l'application
-        run: gradle :app:assembleDebug --no-daemon --stacktrace
+        run: gradle :app:assembleRelease --no-daemon --stacktrace
 
       - name: Renommer le fichier
-        run: cp app/build/outputs/apk/debug/app-debug.apk compteur-cest-ca.apk
+        run: cp app/build/outputs/apk/release/app-release.apk compteur-cest-ca.apk && ls -la compteur-cest-ca.apk
 
       - name: Garder l'APK dans l'exécution
         uses: actions/upload-artifact@v4
@@ -49,7 +48,7 @@ jobs:
       - name: Publier dans « Releases »
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v1.${{ github.run_number }}
-          name: Compteur c'est ça – version 1.${{ github.run_number }}
+          tag_name: v2.${{ github.run_number }}
+          name: Compteur c'est ça – version 2.${{ github.run_number }}
           body: Télécharger compteur-cest-ca.apk depuis le téléphone, puis l'ouvrir pour l'installer.
           files: compteur-cest-ca.apk
