@@ -24,8 +24,11 @@ jobs:
           python -m pip install --upgrade pip
           pip install faster-whisper sounddevice pyinstaller huggingface_hub
 
-      - name: Récupérer le modèle Whisper « small » (inclus dans le programme)
-        run: python -c "from huggingface_hub import snapshot_download; snapshot_download('Systran/faster-whisper-small', local_dir='pc/modeles/small')"
+      - name: Préparer le modèle Whisper « small » compressé (inclus dans le programme)
+        run: |
+          pip install "transformers<4.50" torch --index-url https://download.pytorch.org/whl/cpu --extra-index-url https://pypi.org/simple
+          ct2-transformers-converter --model openai/whisper-small --output_dir pc/modeles/small --quantization int8 --copy_files tokenizer.json preprocessor_config.json
+          dir pc/modeles/small
 
       - name: Fabriquer le programme
         run: >
@@ -48,7 +51,9 @@ jobs:
 
       - name: Mettre en archive
         shell: pwsh
-        run: Compress-Archive -Path dist\CompteurCestCa -DestinationPath CompteurCestCa-Windows.zip
+        run: |
+          Compress-Archive -Path dist\CompteurCestCa -DestinationPath CompteurCestCa-Windows.zip -CompressionLevel Optimal
+          Get-Item CompteurCestCa-Windows.zip | Select-Object Name, Length
 
       - name: Publier dans « Releases »
         uses: softprops/action-gh-release@v2
