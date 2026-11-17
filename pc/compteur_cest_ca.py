@@ -19,8 +19,10 @@ import numpy as np
 
 FREQ = 16000                 # échantillons par seconde attendus par Whisper
 BLOC = FREQ // 10            # 0,1 s
-TRANCHE_MAX = FREQ * 8       # on analyse au plus 8 s à la fois…
-TRANCHE_MIN = FREQ * 5       # …en coupant dans un blanc entre 5 et 8 s
+PAUSE_BLOCS = 3              # une pause de 0,3 s termine un bout de phrase
+TRANCHE_MAX = FREQ * 6       # au-delà de 6 s sans pause, on coupe quand même…
+TRANCHE_MIN = FREQ * 4       # …au moment le plus calme entre 4 et 6 s
+AVANT = 2                    # on garde 0,2 s de son avant le début de la parole
 
 MOTIF = re.compile(r"\b(?:[cs]\s*['’]?\s*est|sait|ses|ces|cé)\s*(?:ça|ca|sa)\b", re.IGNORECASE)
 
@@ -71,10 +73,11 @@ def charger_modele(nom):
 
 
 def transcrire(modele, son):
+    marge = np.zeros(FREQ // 4, dtype=np.float32)
+    son = np.concatenate([marge, son, marge])
     segments, _ = modele.transcribe(
         son, language="fr", beam_size=1, best_of=1, temperature=0.0,
-        condition_on_previous_text=False, vad_filter=True,
-        vad_parameters={"min_silence_duration_ms": 300},
+        condition_on_previous_text=False, vad_filter=False,
         without_timestamps=True,
     )
     return " ".join(s.text.strip() for s in segments).strip()
@@ -108,8 +111,8 @@ class Application:
 
         racine.title("Compteur de « c'est ça »")
         racine.configure(bg=FOND)
-        racine.geometry("560x760")
-        racine.minsize(460, 600)
+        racine.geometry("520x600")
+        racine.minsize(440, 540)
 
         tk.Label(racine, text="Compteur de « c'est ça »", bg=FOND, fg=DOUX,
                  font=("Segoe UI", 15)).pack(pady=(16, 6))
@@ -151,11 +154,9 @@ class Application:
         self.duree = self.stat(stats, "00:00", "durée d'écoute")
         self.rythme = self.stat(stats, "–", "par minute")
 
-        self.texte = tk.Text(racine, bg=CARTE, fg=DOUX, font=("Segoe UI", 11), wrap="word", relief="flat",
-                             padx=12, pady=10, height=10)
-        self.texte.pack(fill="both", expand=True, padx=20, pady=(12, 18))
-        self.texte.tag_configure("trouve", background=ACCENT, foreground=FOND, font=("Segoe UI", 11, "bold"))
-        self.afficher_texte()
+        self.dernier = tk.Label(racine, text="", bg=FOND, fg=DOUX, font=("Segoe UI", 10))
+        self.dernier.pack(pady=(14, 0))
+        self.heure_dernier = None
 
         racine.protocol("WM_DELETE_WINDOW", self.fermer)
         self.racine.after(200, self.boucle_ui)
@@ -186,23 +187,9 @@ class Application:
     def mettre_etat(self, texte, couleur):
         self.etat.configure(text=texte, fg=couleur)
 
-    def afficher_texte(self):
-        self.texte.configure(state="normal")
-        self.texte.delete("1.0", "end")
-        if not self.historique:
-            self.texte.insert("end", "Le texte entendu s'affichera ici, toutes les quelques secondes.")
-        for phrase in self.historique[-15:]:
-            debut = 0
-            for m in MOTIF.finditer(phrase.replace("’", "'")):
-                self.texte.insert("end", phrase[debut:m.start()])
-                self.texte.insert("end", phrase[m.start():m.end()], "trouve")
-                debut = m.end()
-            self.texte.insert("end", phrase[debut:] + "\n")
-        self.texte.see("end")
-        self.texte.configure(state="disabled")
-
     def ajouter(self, n):
         self.compte += n
+        self.heure_dernier = time.time()
         self.cercle.itemconfigure(self.nombre, text=str(self.compte))
         self.cercle.itemconfigure(self.anneau, outline=ACCENT)
         self.racine.after(400, lambda: self.cercle.itemconfigure(
@@ -281,9 +268,8 @@ class Application:
         self.cumul = 0.0
         if self.en_ecoute:
             self.debut = time.time()
-        self.historique.clear()
+        self.heure_dernier = None
         self.cercle.itemconfigure(self.nombre, text="0")
-        self.afficher_texte()
 
     def fermer(self):
         try:
@@ -297,27 +283,45 @@ class Application:
 
     # ------------------------------------------------------------ analyse (tâche de fond)
     def analyser(self, session, modele, file_son, freq_micro):
-        tampon = np.zeros(0, dtype=np.float32)
+        """Repère les moments où quelqu'un parle et envoie chaque bout de phrase dès la première pause."""
+        phrase = []            # blocs de 0,1 s de la phrase en cours
+        avant = []             # derniers blocs calmes (pour ne pas couper le début d'un mot)
+        silences = 0
+        fond = 0.002           # niveau du bruit de fond, ajusté en continu
         while True:
             bloc = file_son.get()
-            fin = bloc is None
-            if not fin:
-                if freq_micro != FREQ:  # mise à 16 000 échantillons par seconde
-                    n = int(round(len(bloc) * FREQ / freq_micro))
-                    bloc = np.interp(np.linspace(0, len(bloc) - 1, n), np.arange(len(bloc)), bloc).astype(np.float32)
-                tampon = np.concatenate([tampon, bloc])
-            while len(tampon) >= TRANCHE_MAX:
-                coupe = chercher_blanc(tampon)
-                self.transcrire_tranche(session, modele, tampon[:coupe], file_son)
-                tampon = tampon[coupe:]
-            if fin:
-                if len(tampon) > FREQ // 2:
-                    self.transcrire_tranche(session, modele, tampon, file_son)
+            if bloc is None:
+                if phrase:
+                    self.transcrire_tranche(session, modele, np.concatenate(phrase), file_son)
                 self.file_ui.put(("fin_analyse", session))
                 return
+            if freq_micro != FREQ:  # mise à 16 000 échantillons par seconde
+                n = int(round(len(bloc) * FREQ / freq_micro))
+                bloc = np.interp(np.linspace(0, len(bloc) - 1, n), np.arange(len(bloc)), bloc).astype(np.float32)
+            niveau = float(np.sqrt(np.mean(bloc ** 2)))
+            parle = niveau > max(0.004, fond * 3)
+            if not parle:
+                fond = 0.95 * fond + 0.05 * niveau
+            if phrase:
+                phrase.append(bloc)
+                silences = 0 if parle else silences + 1
+                longueur = sum(len(b) for b in phrase)
+                if silences >= PAUSE_BLOCS:
+                    self.transcrire_tranche(session, modele, np.concatenate(phrase), file_son)
+                    phrase, avant, silences = [], [], 0
+                elif longueur >= TRANCHE_MAX:
+                    son = np.concatenate(phrase)
+                    coupe = chercher_blanc(son)
+                    self.transcrire_tranche(session, modele, son[:coupe], file_son)
+                    phrase, silences = [son[coupe:]], 0
+            elif parle:
+                phrase = avant[-AVANT:] + [bloc]
+                silences = 0
+            else:
+                avant = (avant + [bloc])[-AVANT:]
 
     def transcrire_tranche(self, session, modele, son, file_son):
-        if float(np.sqrt(np.mean(son ** 2))) < 0.0015:  # silence complet
+        if len(son) < FREQ * 3 // 10:  # bruit trop bref pour être une parole
             return
         self.analyse_en_cours = True
         try:
@@ -360,9 +364,6 @@ class Application:
                     n = compter(texte)
                     if n:
                         self.ajouter(n)
-                    self.historique.append(texte)
-                    del self.historique[:-50]
-                    self.afficher_texte()
                 elif msg[0] == "fin_analyse" and msg[1] == self.session and not self.en_ecoute:
                     self.mettre_etat("● À l'arrêt", DOUX)
         except queue.Empty:
@@ -373,7 +374,12 @@ class Application:
             if retard >= 4:
                 self.mettre_etat(f"● J'écoute… (analyse en retard de {retard:.0f} s, rien n'est perdu)", ACCENT)
             else:
-                self.mettre_etat(f"● J'écoute… (analyse sur le {self.materiel}, texte toutes les ~5 s)", VERT)
+                self.mettre_etat(f"● J'écoute… (analyse sur le {self.materiel})", VERT)
+        if self.heure_dernier is not None:
+            ecart = int(time.time() - self.heure_dernier)
+            self.dernier.configure(text=f"Dernier « c'est ça » il y a {ecart} s" if ecart < 3600 else "")
+        else:
+            self.dernier.configure(text="")
         s = int(self.duree_totale())
         self.duree.configure(text=f"{s // 60:02d}:{s % 60:02d}")
         minutes = self.duree_totale() / 60

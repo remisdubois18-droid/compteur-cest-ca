@@ -26,7 +26,7 @@ jobs:
 
       - name: Préparer le modèle Whisper « small » compressé (inclus dans le programme)
         run: |
-          pip install "transformers<4.50" torch --index-url https://download.pytorch.org/whl/cpu --extra-index-url https://pypi.org/simple
+          pip install "transformers>=4.56" torch --index-url https://download.pytorch.org/whl/cpu --extra-index-url https://pypi.org/simple
           ct2-transformers-converter --model openai/whisper-small --output_dir pc/modeles/small --quantization int8 --copy_files tokenizer.json preprocessor_config.json
           dir pc/modeles/small
 
