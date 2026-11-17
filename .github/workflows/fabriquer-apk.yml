@@ -3,6 +3,7 @@ name: Fabriquer l'APK
 on:
   push:
     branches: [ main ]
+    paths-ignore: [ 'pc/**', '.github/workflows/fabriquer-windows.yml' ]
   workflow_dispatch:
 
 permissions:

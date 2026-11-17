@@ -1,0 +1,59 @@
+name: Fabriquer le programme Windows
+
+on:
+  push:
+    branches: [ main ]
+    paths: [ 'pc/**', '.github/workflows/fabriquer-windows.yml' ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Installer les composants
+        run: |
+          python -m pip install --upgrade pip
+          pip install faster-whisper sounddevice pyinstaller huggingface_hub
+
+      - name: Récupérer le modèle Whisper « small » (inclus dans le programme)
+        run: python -c "from huggingface_hub import snapshot_download; snapshot_download('Systran/faster-whisper-small', local_dir='pc/modeles/small')"
+
+      - name: Fabriquer le programme
+        run: >
+          pyinstaller --noconfirm --windowed --name CompteurCestCa
+          --collect-data faster_whisper
+          --collect-binaries ctranslate2
+          --collect-binaries onnxruntime
+          --collect-data _sounddevice_data
+          --add-data "pc/modeles;modeles"
+          pc/compteur_cest_ca.py
+
+      - name: Tester le programme fabriqué
+        shell: pwsh
+        run: |
+          $env:FICHIER_TEST = "$PWD\test_resultat.txt"
+          Start-Process -FilePath "dist\CompteurCestCa\CompteurCestCa.exe" -ArgumentList "--test" -Wait
+          if (!(Test-Path test_resultat.txt)) { Write-Error "Le programme n'a pas réussi à démarrer le moteur"; exit 1 }
+          Get-Content test_resultat.txt
+          if (!(Select-String -Path test_resultat.txt -Pattern "comptage=3")) { Write-Error "Comptage incorrect"; exit 1 }
+
+      - name: Mettre en archive
+        shell: pwsh
+        run: Compress-Archive -Path dist\CompteurCestCa -DestinationPath CompteurCestCa-Windows.zip
+
+      - name: Publier dans « Releases »
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: windows-v1.${{ github.run_number }}
+          name: Compteur c'est ça – Windows 1.${{ github.run_number }}
+          body: Décompresser CompteurCestCa-Windows.zip, puis lancer CompteurCestCa.exe dans le dossier obtenu.
+          files: CompteurCestCa-Windows.zip
