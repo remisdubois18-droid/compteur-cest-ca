@@ -28,7 +28,7 @@ public class ButtonCounterService extends Service {
         if(intent!=null && STOP.equals(intent.getAction())) {
             Counters.setRunning(this,false);
             releaseMediaSession();
-            stopForeground(STOP_FOREGROUND_REMOVE);
+            stopForeground(true);
             stopSelf();
             return START_NOT_STICKY;
         }
