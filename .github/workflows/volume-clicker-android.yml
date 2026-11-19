@@ -7,7 +7,7 @@ on:
       - '.github/workflows/volume-clicker-android.yml'
   workflow_dispatch:
 permissions:
-  contents: read
+  contents: write
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -26,11 +26,20 @@ jobs:
       - name: Install Android SDK 35
         run: |
           "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" 'platforms;android-35' 'build-tools;35.0.0'
-      - name: Build debug APK
-        run: gradle --no-daemon assembleDebug
+      - name: Build APK
+        run: |
+          gradle --no-daemon assembleRelease
+          cp app/build/outputs/apk/release/app-release.apk ../compteur-volume.apk
       - uses: actions/upload-artifact@v4
         with:
           name: VolumeClicker-APK
-          path: volume-clicker-android/app/build/outputs/apk/debug/app-debug.apk
+          path: compteur-volume.apk
           if-no-files-found: error
           retention-days: 30
+      - name: Publier dans « Releases »
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: compteur-volume-v3.${{ github.run_number }}
+          name: Compteur (touches de volume) – version 3.${{ github.run_number }}
+          body: Télécharger compteur-volume.apk depuis le téléphone, puis l'ouvrir pour l'installer.
+          files: compteur-volume.apk

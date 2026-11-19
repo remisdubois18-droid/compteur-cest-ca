@@ -1,12 +1,44 @@
 plugins { id 'com.android.application' }
+
 android {
     namespace 'fr.volumeclicker'
     compileSdk 35
+
     defaultConfig {
         applicationId 'fr.volumeclicker'
         minSdk 23
         targetSdk 35
-        versionCode 2
-        versionName '2.0-experimental'
+        versionCode 3
+        versionName '3.0'
+    }
+
+    // Signature fixe : chaque nouvelle version s'installe par-dessus la précédente
+    signingConfigs {
+        fixe {
+            storeFile file('cle-signature.jks')
+            storePassword 'cestca2026'
+            keyAlias 'cestca'
+            keyPassword 'cestca2026'
+        }
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled false
+            signingConfig signingConfigs.fixe
+        }
+        debug {
+            signingConfig signingConfigs.fixe
+        }
+    }
+
+    lint {
+        checkReleaseBuilds false
+        abortOnError false
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
     }
 }
