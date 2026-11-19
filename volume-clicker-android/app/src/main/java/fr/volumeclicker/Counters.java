@@ -59,7 +59,23 @@ final class Counters {
     }
 
     static void nouveauDepart(Context c) {
-        prefs(c).edit().putLong(VIVANT, 0L).putLong(PAUSE_MAX, 0L).apply();
+        prefs(c).edit().putLong(VIVANT, 0L).putLong(PAUSE_MAX, 0L).putString(JOURNAL, "").apply();
+    }
+
+    static final String JOURNAL = "journal";
+
+    /** Garde les 30 derniers événements, avec l'heure au centième de seconde. */
+    static synchronized void journal(Context c, String ligne) {
+        SharedPreferences p = prefs(c);
+        String heure = new java.text.SimpleDateFormat("HH:mm:ss.SS", java.util.Locale.FRANCE).format(new java.util.Date());
+        String tout = p.getString(JOURNAL, "") + heure + "  " + ligne + "\n";
+        String[] lignes = tout.split("\n");
+        if (lignes.length > 30) {
+            StringBuilder sb = new StringBuilder();
+            for (int k = lignes.length - 30; k < lignes.length; k++) sb.append(lignes[k]).append('\n');
+            tout = sb.toString();
+        }
+        p.edit().putString(JOURNAL, tout).apply();
     }
 
     static synchronized void reset(Context c) {

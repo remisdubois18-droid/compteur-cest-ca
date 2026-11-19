@@ -47,7 +47,9 @@ public class ButtonCounterService extends Service {
     private static final String EXTRA_VALEUR = "android.media.EXTRA_VOLUME_STREAM_VALUE";
     private static final String EXTRA_AVANT = "android.media.EXTRA_PREV_VOLUME_STREAM_VALUE";
     private int volumeMax = 15, marge = 3;
-    private boolean remiseEnAttente = false;
+    private volatile boolean lecture = false;
+    private volatile int dernierVolume = -1;
+    private Thread filLecture;
     private AudioTrack silence;
     private PowerManager.WakeLock eveil;
     private final Handler minuterie = new Handler(Looper.getMainLooper());
@@ -177,31 +179,43 @@ public class ButtonCounterService extends Service {
     // ------------------------------------------------------------------ surveillance du volume
 
     private void surveillerVolume() {
-        if (surveillance != null) return;
+        if (filLecture != null) return;
         audio = (AudioManager) getSystemService(Context.AUDIO_SERVICE);
         volumeMax = audio.getStreamMaxVolume(AudioManager.STREAM_MUSIC);
         volumeOrigine = audio.getStreamVolume(AudioManager.STREAM_MUSIC);
         volumeMilieu = Math.max(1, volumeMax / 2);
         marge = Math.max(1, volumeMax / 4);
         remettreAuMilieu();
+        dernierVolume = audio.getStreamVolume(AudioManager.STREAM_MUSIC);
+        Counters.journal(this, "Départ : volume " + dernierVolume + "/" + volumeMax);
+
+        // 1) Lecture directe du niveau du volume, 25 fois par seconde : c'est elle qui compte
+        lecture = true;
+        filLecture = new Thread(() -> {
+            while (lecture) {
+                int v = audio.getStreamVolume(AudioManager.STREAM_MUSIC);
+                if (v != dernierVolume) {
+                    final int de = dernierVolume, pas = Math.abs(v - de);
+                    dernierVolume = v;
+                    minuterie.post(() -> compterPas(pas, de, v));
+                    if (v <= marge || v >= volumeMax - marge) {
+                        try { audio.setStreamVolume(AudioManager.STREAM_MUSIC, volumeMilieu, 0); } catch (Exception ignored) { }
+                        dernierVolume = audio.getStreamVolume(AudioManager.STREAM_MUSIC);
+                        Counters.journal(this, "  recentré à " + dernierVolume);
+                    }
+                }
+                try { Thread.sleep(40); } catch (InterruptedException e) { break; }
+            }
+        }, "lecture-volume");
+        filLecture.start();
+
+        // 2) Les signaux d'Android, seulement notés dans le journal (pour comprendre en cas de souci)
         surveillance = new BroadcastReceiver() {
             @Override
             public void onReceive(Context c, Intent i) {
                 if (i.getIntExtra(EXTRA_FLUX, -1) != AudioManager.STREAM_MUSIC) return;
-                int valeur = i.getIntExtra(EXTRA_VALEUR, -1);
-                int avant = i.getIntExtra(EXTRA_AVANT, -1);
-                if (valeur < 0 || valeur == avant) return;            // pas de changement réel
-                if (remiseEnAttente && valeur == volumeMilieu) {      // c'est notre propre remise au milieu
-                    remiseEnAttente = false;
-                    return;
-                }
-                // Chaque cran reçu = un appui, même s'ils arrivent tous en même temps
-                if (Counters.ajouter(ButtonCounterService.this)) {
-                    vibrer();
-                    majNotification();
-                }
-                // On ne recentre le volume qu'à l'approche du minimum ou du maximum
-                if (valeur <= marge || valeur >= volumeMax - marge) remettreAuMilieu();
+                Counters.journal(ButtonCounterService.this, "  (signal Android " + i.getIntExtra(EXTRA_AVANT, -1)
+                        + " → " + i.getIntExtra(EXTRA_VALEUR, -1) + ")");
             }
         };
         IntentFilter filtre = new IntentFilter(VOLUME_CHANGE);
@@ -209,10 +223,18 @@ public class ButtonCounterService extends Service {
         else registerReceiver(surveillance, filtre);
     }
 
+    private void compterPas(int pas, int de, int a) {
+        int comptes = 0;
+        for (int k = 0; k < pas; k++) if (Counters.ajouter(this)) comptes++;
+        Counters.journal(this, "Volume " + de + " → " + a + " : +" + comptes);
+        if (comptes > 0) {
+            vibrer();
+            majNotification();
+        }
+    }
+
     private void remettreAuMilieu() {
         try {
-            if (audio.getStreamVolume(AudioManager.STREAM_MUSIC) == volumeMilieu) return;
-            remiseEnAttente = true;
             audio.setStreamVolume(AudioManager.STREAM_MUSIC, volumeMilieu, 0);
         } catch (Exception ignored) { } // mode « Ne pas déranger » : Android peut refuser
     }
@@ -234,6 +256,12 @@ public class ButtonCounterService extends Service {
 
     private void toutArreter() {
         minuterie.removeCallbacks(battement);
+        lecture = false;
+        if (filLecture != null) {
+            filLecture.interrupt();
+            try { filLecture.join(300); } catch (InterruptedException ignored) { }
+            filLecture = null;
+        }
         if (surveillance != null) {
             try { unregisterReceiver(surveillance); } catch (Exception ignored) { }
             surveillance = null;

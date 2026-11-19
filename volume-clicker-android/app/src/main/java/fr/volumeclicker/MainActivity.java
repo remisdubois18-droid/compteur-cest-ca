@@ -30,7 +30,7 @@ public class MainActivity extends Activity {
     private static final int ROUGE = Color.parseColor("#e5484d");
     private static final int DOUX = Color.parseColor("#a9adc9");
 
-    private TextView nombre, etat;
+    private TextView nombre, etat, journal;
     private Button bascule;
     private GradientDrawable anneau;
     private SharedPreferences preferences;
@@ -169,6 +169,23 @@ public class MainActivity extends Activity {
         pa.topMargin = dp(14);
         racine.addView(aide, pa);
 
+        TextView titreJournal = new TextView(this);
+        titreJournal.setText("Journal (pour diagnostiquer) :");
+        titreJournal.setTextColor(DOUX);
+        titreJournal.setTextSize(13);
+        titreJournal.setTypeface(Typeface.DEFAULT_BOLD);
+        LinearLayout.LayoutParams pj = new LinearLayout.LayoutParams(-1, -2);
+        pj.topMargin = dp(16);
+        racine.addView(titreJournal, pj);
+        journal = new TextView(this);
+        journal.setTextColor(Color.WHITE);
+        journal.setTextSize(11);
+        journal.setTypeface(Typeface.MONOSPACE);
+        journal.setTextIsSelectable(true);
+        journal.setPadding(dp(10), dp(10), dp(10), dp(10));
+        journal.setBackground(arrondi(CARTE));
+        racine.addView(journal, new LinearLayout.LayoutParams(-1, -2));
+
         setContentView(defilement);
     }
 
@@ -245,6 +262,8 @@ public class MainActivity extends Activity {
     private void rafraichir() {
         if (nombre == null) return;
         nombre.setText(String.valueOf(Counters.total(this)));
+        String j = preferences.getString(Counters.JOURNAL, "");
+        journal.setText(j.isEmpty() ? "(vide)" : j);
         boolean actif = Counters.running(this);
         long pause = preferences.getLong(Counters.PAUSE_MAX, 0L);
         long vivant = preferences.getLong(Counters.VIVANT, 0L);
