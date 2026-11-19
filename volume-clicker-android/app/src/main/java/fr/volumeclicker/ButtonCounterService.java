@@ -45,6 +45,9 @@ public class ButtonCounterService extends Service {
     private static final String VOLUME_CHANGE = "android.media.VOLUME_CHANGED_ACTION";
     private static final String EXTRA_FLUX = "android.media.EXTRA_VOLUME_STREAM_TYPE";
     private static final String EXTRA_VALEUR = "android.media.EXTRA_VOLUME_STREAM_VALUE";
+    private static final String EXTRA_AVANT = "android.media.EXTRA_PREV_VOLUME_STREAM_VALUE";
+    private int volumeMax = 15, marge = 3;
+    private boolean remiseEnAttente = false;
     private AudioTrack silence;
     private PowerManager.WakeLock eveil;
     private final Handler minuterie = new Handler(Looper.getMainLooper());
@@ -176,21 +179,29 @@ public class ButtonCounterService extends Service {
     private void surveillerVolume() {
         if (surveillance != null) return;
         audio = (AudioManager) getSystemService(Context.AUDIO_SERVICE);
-        int max = audio.getStreamMaxVolume(AudioManager.STREAM_MUSIC);
+        volumeMax = audio.getStreamMaxVolume(AudioManager.STREAM_MUSIC);
         volumeOrigine = audio.getStreamVolume(AudioManager.STREAM_MUSIC);
-        volumeMilieu = Math.max(1, max / 2);
+        volumeMilieu = Math.max(1, volumeMax / 2);
+        marge = Math.max(1, volumeMax / 4);
         remettreAuMilieu();
         surveillance = new BroadcastReceiver() {
             @Override
             public void onReceive(Context c, Intent i) {
                 if (i.getIntExtra(EXTRA_FLUX, -1) != AudioManager.STREAM_MUSIC) return;
-                int valeur = i.getIntExtra(EXTRA_VALEUR, volumeMilieu);
-                if (valeur == volumeMilieu) return; // c'est notre propre remise au milieu
-                remettreAuMilieu();
-                if (Counters.increment(ButtonCounterService.this)) {
+                int valeur = i.getIntExtra(EXTRA_VALEUR, -1);
+                int avant = i.getIntExtra(EXTRA_AVANT, -1);
+                if (valeur < 0 || valeur == avant) return;            // pas de changement réel
+                if (remiseEnAttente && valeur == volumeMilieu) {      // c'est notre propre remise au milieu
+                    remiseEnAttente = false;
+                    return;
+                }
+                // Chaque cran reçu = un appui, même s'ils arrivent tous en même temps
+                if (Counters.ajouter(ButtonCounterService.this)) {
                     vibrer();
                     majNotification();
                 }
+                // On ne recentre le volume qu'à l'approche du minimum ou du maximum
+                if (valeur <= marge || valeur >= volumeMax - marge) remettreAuMilieu();
             }
         };
         IntentFilter filtre = new IntentFilter(VOLUME_CHANGE);
@@ -200,6 +211,8 @@ public class ButtonCounterService extends Service {
 
     private void remettreAuMilieu() {
         try {
+            if (audio.getStreamVolume(AudioManager.STREAM_MUSIC) == volumeMilieu) return;
+            remiseEnAttente = true;
             audio.setStreamVolume(AudioManager.STREAM_MUSIC, volumeMilieu, 0);
         } catch (Exception ignored) { } // mode « Ne pas déranger » : Android peut refuser
     }

@@ -31,6 +31,14 @@ final class Counters {
         return true;
     }
 
+    /** +1 sans aucun filtre (chaque cran de volume reçu correspond à un appui). */
+    static synchronized boolean ajouter(Context c) {
+        if (!running(c)) return false;
+        SharedPreferences p = prefs(c);
+        p.edit().putLong(TOTAL, p.getLong(TOTAL, 0L) + 1L).commit();
+        return true;
+    }
+
     static synchronized void decrement(Context c) {
         SharedPreferences p = prefs(c);
         p.edit().putLong(TOTAL, Math.max(0L, p.getLong(TOTAL, 0L) - 1L)).commit();
