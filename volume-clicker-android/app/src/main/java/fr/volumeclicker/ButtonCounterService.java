@@ -17,7 +17,9 @@ import android.media.AudioTrack;
 import android.media.session.MediaSession;
 import android.media.session.PlaybackState;
 import android.os.Build;
+import android.os.Handler;
 import android.os.IBinder;
+import android.os.Looper;
 import android.os.PowerManager;
 import android.os.VibrationEffect;
 import android.os.Vibrator;
@@ -45,6 +47,13 @@ public class ButtonCounterService extends Service {
     private static final String EXTRA_VALEUR = "android.media.EXTRA_VOLUME_STREAM_VALUE";
     private AudioTrack silence;
     private PowerManager.WakeLock eveil;
+    private final Handler minuterie = new Handler(Looper.getMainLooper());
+    private final Runnable battement = new Runnable() {
+        @Override public void run() {
+            Counters.battement(ButtonCounterService.this);
+            minuterie.postDelayed(this, 2000);
+        }
+    };
 
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
@@ -66,6 +75,8 @@ public class ButtonCounterService extends Service {
             demarrerSession();
             surveillerVolume();
             garderEveille();
+            minuterie.removeCallbacks(battement);
+            minuterie.post(battement);
         } catch (RuntimeException e) {
             Counters.setRunning(this, false);
             toutArreter();
@@ -209,6 +220,7 @@ public class ButtonCounterService extends Service {
     }
 
     private void toutArreter() {
+        minuterie.removeCallbacks(battement);
         if (surveillance != null) {
             try { unregisterReceiver(surveillance); } catch (Exception ignored) { }
             surveillance = null;

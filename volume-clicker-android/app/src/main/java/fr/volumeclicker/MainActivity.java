@@ -183,9 +183,12 @@ public class MainActivity extends Activity {
         }
         new AlertDialog.Builder(this)
                 .setTitle("Fonctionnement en arrière-plan")
-                .setMessage("Sur OPPO (ColorOS) : dans les informations de l'application, ouvrez « Utilisation de la batterie » "
-                        + "et autorisez l'activité en arrière-plan / choisissez « Sans restriction ». "
-                        + "Sinon le téléphone peut couper le compteur quand l'écran est éteint.")
+                .setMessage("Dans les informations de l'application « Compteur » :\n\n"
+                        + "• Notifications : autorisées\n"
+                        + "• Batterie / Utilisation de la batterie : « Sans restriction » ou « Autoriser l'activité en arrière-plan »\n"
+                        + "• Sur OPPO / Realme / OnePlus : activez aussi « Autoriser le démarrage automatique », "
+                        + "et dans la liste des applications récentes, verrouillez « Compteur » (petit cadenas).\n\n"
+                        + "Sinon le téléphone met le compteur en pause quand il n'est plus à l'écran.")
                 .setNegativeButton("Fermer", null)
                 .setPositiveButton("Ouvrir les réglages", (d, w) -> startActivity(new Intent(
                         Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.parse("package:" + getPackageName()))))
@@ -199,10 +202,35 @@ public class MainActivity extends Activity {
             rafraichir();
             return;
         }
+        // La notification est indispensable : sans elle, le téléphone gèle le compteur en arrière-plan
         if (Build.VERSION.SDK_INT >= 33
                 && checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
             requestPermissions(new String[]{Manifest.permission.POST_NOTIFICATIONS}, 101);
+            return; // on démarre une fois la réponse donnée
         }
+        demarrerService();
+    }
+
+    @Override
+    public void onRequestPermissionsResult(int code, String[] permissions, int[] resultats) {
+        super.onRequestPermissionsResult(code, permissions, resultats);
+        if (code != 101) return;
+        if (resultats.length > 0 && resultats[0] == PackageManager.PERMISSION_GRANTED) {
+            demarrerService();
+        } else {
+            new AlertDialog.Builder(this)
+                    .setTitle("Notifications refusées")
+                    .setMessage("Sans notification, le téléphone met le compteur en pause dès qu'il n'est plus à l'écran. "
+                            + "Autorisez les notifications de « Compteur » dans les réglages, puis appuyez à nouveau sur Démarrer.")
+                    .setNegativeButton("Fermer", null)
+                    .setPositiveButton("Ouvrir les réglages", (d, w) -> startActivity(new Intent(
+                            Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.parse("package:" + getPackageName()))))
+                    .show();
+        }
+    }
+
+    private void demarrerService() {
+        Counters.nouveauDepart(this);
         Intent i = new Intent(this, ButtonCounterService.class).setAction(ButtonCounterService.START);
         try {
             if (Build.VERSION.SDK_INT >= 26) startForegroundService(i);
@@ -218,8 +246,22 @@ public class MainActivity extends Activity {
         if (nombre == null) return;
         nombre.setText(String.valueOf(Counters.total(this)));
         boolean actif = Counters.running(this);
-        etat.setText(actif ? "● Comptage actif – fonctionne téléphone verrouillé" : "○ Comptage arrêté");
-        etat.setTextColor(actif ? VERT : DOUX);
+        long pause = preferences.getLong(Counters.PAUSE_MAX, 0L);
+        long vivant = preferences.getLong(Counters.VIVANT, 0L);
+        if (!actif) {
+            etat.setText("○ Comptage arrêté");
+            etat.setTextColor(DOUX);
+        } else if (vivant == 0L) {
+            etat.setText("⚠ Le compteur d'arrière-plan n'a pas démarré");
+            etat.setTextColor(ROUGE);
+        } else if (pause > 0) {
+            etat.setText("⚠ Le téléphone a mis le compteur en pause (jusqu'à " + (pause / 1000)
+                    + " s). Faites les « Réglages batterie » ci-dessous.");
+            etat.setTextColor(ACCENT);
+        } else {
+            etat.setText("● Comptage actif, aucune pause constatée");
+            etat.setTextColor(VERT);
+        }
         anneau.setStroke(dp(6), actif ? VERT : Color.parseColor("#343a6b"));
         bascule.setText(actif ? "■  Arrêter" : "▶  Démarrer");
         bascule.setBackground(arrondi(actif ? ROUGE : VERT));

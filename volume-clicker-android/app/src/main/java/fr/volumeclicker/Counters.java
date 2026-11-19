@@ -36,6 +36,24 @@ final class Counters {
         p.edit().putLong(TOTAL, Math.max(0L, p.getLong(TOTAL, 0L) - 1L)).commit();
     }
 
+    static final String VIVANT = "vivant", PAUSE_MAX = "pause_max";
+
+    /** Le service signale toutes les 2 s qu'il tourne ; une pause plus longue veut dire que le téléphone l'a gelé. */
+    static void battement(Context c) {
+        SharedPreferences p = prefs(c);
+        long maintenant = System.currentTimeMillis();
+        long dernier = p.getLong(VIVANT, 0L);
+        SharedPreferences.Editor e = p.edit().putLong(VIVANT, maintenant);
+        if (dernier > 0 && maintenant - dernier > 6000) {
+            e.putLong(PAUSE_MAX, Math.max(p.getLong(PAUSE_MAX, 0L), maintenant - dernier));
+        }
+        e.apply();
+    }
+
+    static void nouveauDepart(Context c) {
+        prefs(c).edit().putLong(VIVANT, 0L).putLong(PAUSE_MAX, 0L).apply();
+    }
+
     static synchronized void reset(Context c) {
         prefs(c).edit().putLong(TOTAL, 0L).commit();
         dernierAppui = -1L;

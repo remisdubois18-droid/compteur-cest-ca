@@ -8,8 +8,8 @@ android {
         applicationId 'fr.volumeclicker'
         minSdk 23
         targetSdk 35
-        versionCode 4
-        versionName '3.1'
+        versionCode 5
+        versionName '3.2'
     }
 
     // Signature fixe : chaque nouvelle version s'installe par-dessus la précédente
