@@ -6,13 +6,14 @@ import android.app.NotificationManager;
 import android.app.PendingIntent;
 import android.app.Service;
 import android.content.Context;
+import android.content.BroadcastReceiver;
 import android.content.Intent;
+import android.content.IntentFilter;
 import android.content.pm.ServiceInfo;
 import android.media.AudioAttributes;
 import android.media.AudioFormat;
 import android.media.AudioManager;
 import android.media.AudioTrack;
-import android.media.VolumeProvider;
 import android.media.session.MediaSession;
 import android.media.session.PlaybackState;
 import android.os.Build;
@@ -24,9 +25,10 @@ import android.os.Vibrator;
 /**
  * Compte les appuis sur les touches de volume, même téléphone verrouillé et écran éteint.
  *
- * Écran éteint, Android n'envoie les touches de volume qu'à l'application qui joue du son.
- * Le service joue donc en boucle un son totalement silencieux, et déclare une « session
- * multimédia » dont il gère lui-même le volume : chaque appui arrive ici au lieu de changer le volume.
+ * Écran éteint, Android ne modifie le volume que si un son est en train de jouer : le service joue
+ * donc en boucle un son inaudible. Il surveille ensuite le niveau du volume « multimédia » :
+ * à chaque changement, il compte 1 et remet aussitôt le volume au milieu, pour que le prochain
+ * appui (Volume + ou Volume −) provoque à nouveau un changement.
  */
 public class ButtonCounterService extends Service {
     public static final String START = "fr.volumeclicker.action.START";
@@ -35,6 +37,12 @@ public class ButtonCounterService extends Service {
     private static final int NOTIFICATION_ID = 17;
 
     private MediaSession session;
+    private AudioManager audio;
+    private BroadcastReceiver surveillance;
+    private int volumeOrigine = -1, volumeMilieu = -1;
+    private static final String VOLUME_CHANGE = "android.media.VOLUME_CHANGED_ACTION";
+    private static final String EXTRA_FLUX = "android.media.EXTRA_VOLUME_STREAM_TYPE";
+    private static final String EXTRA_VALEUR = "android.media.EXTRA_VOLUME_STREAM_VALUE";
     private AudioTrack silence;
     private PowerManager.WakeLock eveil;
 
@@ -56,6 +64,7 @@ public class ButtonCounterService extends Service {
             afficherNotification();
             demarrerSilence();
             demarrerSession();
+            surveillerVolume();
             garderEveille();
         } catch (RuntimeException e) {
             Counters.setRunning(this, false);
@@ -128,7 +137,9 @@ public class ButtonCounterService extends Service {
                 .build();
         silence = new AudioTrack(attributs, format, images * 2, AudioTrack.MODE_STATIC,
                 AudioManager.AUDIO_SESSION_ID_GENERATE);
-        silence.write(new short[images], 0, images);
+        short[] son = new short[images];
+        for (int i = 0; i < images; i++) son[i] = (short) ((i % 2 == 0) ? 1 : -1); // inaudible
+        silence.write(son, 0, images);
         silence.setLoopPoints(0, images, -1);
         silence.play();
     }
@@ -138,23 +149,48 @@ public class ButtonCounterService extends Service {
     private void demarrerSession() {
         if (session != null) return;
         session = new MediaSession(this, "CompteurVolume");
-        VolumeProvider volume = new VolumeProvider(VolumeProvider.VOLUME_CONTROL_RELATIVE, 100, 50) {
-            @Override
-            public void onAdjustVolume(int direction) {
-                if (direction == AudioManager.ADJUST_RAISE || direction == AudioManager.ADJUST_LOWER) {
-                    if (Counters.increment(ButtonCounterService.this)) {
-                        vibrer();
-                        majNotification();
-                    }
-                }
-            }
-        };
-        session.setPlaybackToRemote(volume);
+        session.setPlaybackToLocal(new AudioAttributes.Builder()
+                .setUsage(AudioAttributes.USAGE_MEDIA)
+                .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
+                .build());
         session.setPlaybackState(new PlaybackState.Builder()
                 .setState(PlaybackState.STATE_PLAYING, PlaybackState.PLAYBACK_POSITION_UNKNOWN, 1.0f)
                 .setActions(PlaybackState.ACTION_PLAY | PlaybackState.ACTION_PAUSE)
                 .build());
         session.setActive(true);
+    }
+
+    // ------------------------------------------------------------------ surveillance du volume
+
+    private void surveillerVolume() {
+        if (surveillance != null) return;
+        audio = (AudioManager) getSystemService(Context.AUDIO_SERVICE);
+        int max = audio.getStreamMaxVolume(AudioManager.STREAM_MUSIC);
+        volumeOrigine = audio.getStreamVolume(AudioManager.STREAM_MUSIC);
+        volumeMilieu = Math.max(1, max / 2);
+        remettreAuMilieu();
+        surveillance = new BroadcastReceiver() {
+            @Override
+            public void onReceive(Context c, Intent i) {
+                if (i.getIntExtra(EXTRA_FLUX, -1) != AudioManager.STREAM_MUSIC) return;
+                int valeur = i.getIntExtra(EXTRA_VALEUR, volumeMilieu);
+                if (valeur == volumeMilieu) return; // c'est notre propre remise au milieu
+                remettreAuMilieu();
+                if (Counters.increment(ButtonCounterService.this)) {
+                    vibrer();
+                    majNotification();
+                }
+            }
+        };
+        IntentFilter filtre = new IntentFilter(VOLUME_CHANGE);
+        if (Build.VERSION.SDK_INT >= 33) registerReceiver(surveillance, filtre, Context.RECEIVER_EXPORTED);
+        else registerReceiver(surveillance, filtre);
+    }
+
+    private void remettreAuMilieu() {
+        try {
+            audio.setStreamVolume(AudioManager.STREAM_MUSIC, volumeMilieu, 0);
+        } catch (Exception ignored) { } // mode « Ne pas déranger » : Android peut refuser
     }
 
     private void garderEveille() {
@@ -173,6 +209,14 @@ public class ButtonCounterService extends Service {
     }
 
     private void toutArreter() {
+        if (surveillance != null) {
+            try { unregisterReceiver(surveillance); } catch (Exception ignored) { }
+            surveillance = null;
+        }
+        if (audio != null && volumeOrigine >= 0) {
+            try { audio.setStreamVolume(AudioManager.STREAM_MUSIC, volumeOrigine, 0); } catch (Exception ignored) { }
+            volumeOrigine = -1;
+        }
         if (session != null) {
             session.setActive(false);
             session.release();

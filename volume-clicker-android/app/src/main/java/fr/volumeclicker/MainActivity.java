@@ -160,8 +160,8 @@ public class MainActivity extends Activity {
         TextView aide = new TextView(this);
         aide.setText("Appuyez sur « Démarrer », puis verrouillez le téléphone : chaque appui sur Volume + ou "
                 + "Volume − ajoute 1 (petite vibration). Le compteur s'affiche aussi dans la notification.\n\n"
-                + "Pendant le comptage, les touches de volume ne règlent plus le son. Appuyez sur « Arrêter » "
-                + "pour leur rendre leur rôle normal.");
+                + "Pendant le comptage, les touches de volume ne règlent plus le son (le volume reste au milieu). "
+                + "« Arrêter » rend au volume son niveau d'avant.");
         aide.setTextColor(DOUX);
         aide.setTextSize(13);
         aide.setLineSpacing(0, 1.25f);
